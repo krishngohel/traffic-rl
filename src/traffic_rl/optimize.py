@@ -307,9 +307,260 @@ def _render_chart(results: dict, out: Path) -> None:
     plt.close(fig)
 
 
+# --------------------------------------------------------------------- corridor
+
+CORRIDOR_CYCLE_SCALES = (1.0, 1.2)
+OFFSET_SCHEMES = ("east", "west", "zero")
+CORRIDOR_REFINE_RUNS = 3
+CORRIDOR_REFINE_WARMUP = 300.0
+CORRIDOR_REFINE_MEASURED = 1200.0
+
+
+def _corridor_offsets(scheme: str, n_nodes: int, link_travel: float, cycle: float):
+    if scheme == "east":
+        return tuple((i * link_travel) % cycle for i in range(n_nodes))
+    if scheme == "west":
+        return tuple(((n_nodes - 1 - i) * link_travel) % cycle for i in range(n_nodes))
+    return tuple(0.0 for _ in range(n_nodes))
+
+
+def _corridor_candidates(node_flows, timing, link_travel: float, n_nodes: int):
+    """Coordinated-plan candidates: common cycle scales x progression schemes."""
+    from traffic_rl.controllers.network import CoordinatedPlan, _plan_for_cycle
+
+    base_cycles = [
+        webster_plan(np.asarray(node_flows[i]), 1800.0, timing,
+                     green_floor=timing.ped_service).cycle(timing.yellow, timing.all_red)
+        for i in range(n_nodes)
+    ]
+    common_base = max(base_cycles)
+    candidates = []
+    for scale in CORRIDOR_CYCLE_SCALES:
+        cycle = float(np.clip(common_base * scale, 40.0, 150.0))
+        node_plans = tuple(
+            _plan_for_cycle(np.asarray(node_flows[i]), cycle, timing) for i in range(n_nodes)
+        )
+        for scheme in OFFSET_SCHEMES:
+            offsets = _corridor_offsets(scheme, n_nodes, link_travel, cycle)
+            candidates.append(CoordinatedPlan(node_plans=node_plans, offsets=offsets,
+                                              scheme=scheme))
+    return candidates
+
+
+def optimize_corridor_interval(node_demands, timing, link_travel, seeds):
+    """Best coordinated plan for one interval: (plan, mean per-run journey p95)."""
+    from traffic_rl.controllers.network import ScheduledCoordinatedController
+    from traffic_rl.eval.network_harness import run_network_controller
+    from traffic_rl.sim.network import NetworkConfig
+
+    n_nodes = len(node_demands)
+    config = NetworkConfig(
+        node_demands=tuple(node_demands), n_nodes=n_nodes, link_travel=link_travel,
+        timing=timing, warmup=CORRIDOR_REFINE_WARMUP, measured=CORRIDOR_REFINE_MEASURED,
+    )
+    node_flows = [d.vehicle_rates for d in node_demands]
+    best_plan, best_score = None, np.inf
+    for plan in _corridor_candidates(node_flows, timing, link_travel, n_nodes):
+        controller = ScheduledCoordinatedController([(0.0, plan)])
+        p95s = [
+            run_network_controller(controller, config, seed)["p95_wait"] for seed in seeds
+        ]
+        score = float(np.mean(p95s))
+        if score < best_score:
+            best_plan, best_score = plan, score
+    return best_plan, best_score
+
+
+def optimize_corridor_from_counts(
+    csv_path: Path,
+    runs: int = 10,
+    seed: int = 42,
+    out_dir: Path = Path("results") / "optimize",
+    link_travel: float = 20.0,
+    include_rl: bool = True,
+) -> dict:
+    from traffic_rl.controllers.network import ScheduledCoordinatedController
+    from traffic_rl.data import load_corridor_counts_csv
+    from traffic_rl.eval.network_harness import (
+        network_controller_registry,
+        run_network_controller,
+    )
+    from traffic_rl.sim.network import NetworkConfig
+
+    schedules, duration, n_nodes = load_corridor_counts_csv(csv_path)
+    if duration < MIN_EVAL_SECONDS + 900.0:
+        raise ValueError(
+            f"need at least {(MIN_EVAL_SECONDS + 900) / 60:.0f} min of data, got "
+            f"{duration / 60:.0f} min"
+        )
+    timing = SignalTimingConfig()
+    refine_seeds = run_seeds(seed + 1, CORRIDOR_REFINE_RUNS)
+    print(
+        f"loaded {csv_path}: corridor of {n_nodes} intersections, "
+        f"{len(schedules[0])} intervals, {duration / 3600:.1f} h, "
+        f"link travel {link_travel:.0f} s"
+    )
+
+    tod_plans = []
+    for k, (start, _) in enumerate(schedules[0]):
+        node_demands = [schedules[i][k][1] for i in range(n_nodes)]
+        plan, score = optimize_corridor_interval(node_demands, timing, link_travel,
+                                                 refine_seeds)
+        tod_plans.append((start, plan))
+        greens = "; ".join(f"{p.greens[0]:.0f}/{p.greens[1]:.0f}" for p in plan.node_plans)
+        print(
+            f"  interval @ {start / 3600:5.2f} h  -> common cycle "
+            f"{plan.cycle(timing.yellow, timing.all_red):5.1f} s, {plan.scheme}-wave, "
+            f"greens NS/EW {greens}  (refine journey p95 {score:.1f} s)"
+        )
+
+    config = NetworkConfig(
+        node_demands=tuple(s[0][1] for s in schedules),
+        node_schedules=tuple(schedules),
+        n_nodes=n_nodes,
+        link_travel=link_travel,
+        timing=timing,
+        warmup=900.0,
+        measured=duration - 900.0,
+    )
+    seeds = run_seeds(seed, runs)
+    registry = network_controller_registry()
+    contenders: dict[str, object] = {
+        "optimized_tod_coordinated": ScheduledCoordinatedController(tod_plans),
+        "naive_uncoordinated": registry["naive"](),
+        "greenwave_observed": registry["greenwave"](),
+        "actuated": registry["actuated"](),
+        "max_pressure": registry["max_pressure"](),
+    }
+    if include_rl:
+        try:
+            contenders["rl_shared"] = registry["rl"]()
+        except FileNotFoundError:
+            print("(no trained network RL weights found — skipping rl contender)")
+
+    results: dict[str, dict] = {}
+    for name, controller in contenders.items():
+        runs_out = [run_network_controller(controller, config, s) for s in seeds]
+        results[name] = {
+            "p95": mean_ci(np.array([r["p95_wait"] for r in runs_out])),
+            "mean": mean_ci(np.array([r["mean_wait"] for r in runs_out])),
+            "ped_p95": mean_ci(np.array([r["ped_p95_wait"] for r in runs_out])),
+            "p95_runs": [r["p95_wait"] for r in runs_out],
+            "n_unstable": int(sum(r["unstable"] for r in runs_out)),
+        }
+        print(
+            f"  {name:<26} journey p95 {results[name]['p95']['mean']:6.1f} s "
+            f"(CI {results[name]['p95']['lo']:.1f}-{results[name]['p95']['hi']:.1f})"
+        )
+
+    y, ar = timing.yellow, timing.all_red
+    baseline_key = "naive_uncoordinated"
+    diff = paired_diff_ci(
+        np.array(results[baseline_key]["p95_runs"]),
+        np.array(results["optimized_tod_coordinated"]["p95_runs"]),
+    )
+    base_mean = float(np.mean(results[baseline_key]["p95_runs"]))
+    report = {
+        "source": str(csv_path),
+        "mode": "corridor",
+        "n_nodes": n_nodes,
+        "link_travel_s": link_travel,
+        "n_runs": runs,
+        "baseline": baseline_key,
+        "recommended_plans": [
+            {
+                "start_hour": start / 3600.0,
+                "cycle_s": round(plan.cycle(y, ar), 1),
+                "scheme": plan.scheme,
+                "offsets_s": [round(o, 1) for o in plan.offsets],
+                "node_greens_s": [list(p.greens) for p in plan.node_plans],
+            }
+            for start, plan in tod_plans
+        ],
+        "comparison": {
+            name: {
+                "p95_wait_s": {k: round(v, 2) for k, v in r["p95"].items()},
+                "mean_wait_s": {k: round(v, 2) for k, v in r["mean"].items()},
+                "ped_p95_wait_s": {k: round(v, 2) for k, v in r["ped_p95"].items()},
+                "n_unstable": r["n_unstable"],
+            }
+            for name, r in results.items()
+        },
+        "headline": {
+            "p95_reduction_vs_baseline_s": {k: round(v, 2) for k, v in diff.items()},
+            "p95_reduction_pct": round(100.0 * diff["mean"] / base_mean, 1) if base_mean else 0,
+        },
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / "report.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    (out_dir / "report.md").write_text(_render_corridor_markdown(report), encoding="utf-8")
+    try:
+        _render_chart(results, out_dir / "comparison.png")
+    except ImportError:
+        print("(matplotlib not installed — skipping comparison.png)")
+    print(f"report -> {out_dir}\\report.md")
+    return report
+
+
+def _render_corridor_markdown(report: dict) -> str:
+    lines = [
+        "# Corridor signal timing optimization report",
+        "",
+        f"Source: `{report['source']}` — {report['n_nodes']} intersections, "
+        f"link travel {report['link_travel_s']} s, {report['n_runs']} paired runs "
+        "per contender. Waits are JOURNEY waits: the sum of a vehicle's queue "
+        "waits across every signal it passes.",
+        "",
+        "## Recommended coordinated time-of-day plans",
+        "",
+        "| start | cycle (s) | wave | offsets (s) | per-node greens NS/EW (s) |",
+        "|---|---|---|---|---|",
+    ]
+    for p in report["recommended_plans"]:
+        h = int(p["start_hour"])
+        m = int(round((p["start_hour"] - h) * 60))
+        greens = "; ".join(f"{g[0]:.0f}/{g[1]:.0f}" for g in p["node_greens_s"])
+        offsets = ", ".join(f"{o:.0f}" for o in p["offsets_s"])
+        lines.append(f"| {h:02d}:{m:02d} | {p['cycle_s']} | {p['scheme']} | {offsets} | {greens} |")
+    d = report["headline"]
+    lines += [
+        "",
+        "## Headline",
+        "",
+        f"Coordinated time-of-day plans cut journey p95 wait by "
+        f"**{d['p95_reduction_vs_baseline_s']['mean']} s "
+        f"({d['p95_reduction_pct']}%)** vs `{report['baseline']}` "
+        f"(paired 95% CI {d['p95_reduction_vs_baseline_s']['lo']}"
+        f"–{d['p95_reduction_vs_baseline_s']['hi']} s).",
+        "",
+        "## Full comparison (journey p95, mean of paired runs, 95% CI)",
+        "",
+        "| controller | journey p95 (s) | mean wait (s) | ped p95 (s) | unstable runs |",
+        "|---|---|---|---|---|",
+    ]
+    ordered = sorted(report["comparison"].items(), key=lambda kv: kv[1]["p95_wait_s"]["mean"])
+    for name, r in ordered:
+        lines.append(
+            f"| {name} | {r['p95_wait_s']['mean']} "
+            f"[{r['p95_wait_s']['lo']}, {r['p95_wait_s']['hi']}] "
+            f"| {r['mean_wait_s']['mean']} | {r['ped_p95_wait_s']['mean']} "
+            f"| {r['n_unstable']}/{report['n_runs']} |"
+        )
+    lines += [
+        "",
+        "Model limits: point-queue, through-traffic only (no turns between the "
+        "arterial and cross streets), fixed link travel time, no spillback. "
+        "Treat projections as a screening study.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Optimize signal timing from a traffic-count CSV."
+        description="Optimize signal timing from a traffic-count CSV "
+        "(single intersection, or a corridor when the CSV has a 'node' column)."
     )
     parser.add_argument("data", type=Path, help="counts CSV (see traffic_rl/data.py for format)")
     parser.add_argument("--runs", type=int, default=10)
@@ -317,15 +568,30 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path("results") / "optimize")
     parser.add_argument("--no-rl", action="store_true", help="skip the RL contender")
     parser.add_argument(
+        "--link-travel", type=float, default=20.0,
+        help="corridor mode: free-flow seconds between adjacent intersections",
+    )
+    parser.add_argument(
         "--current-greens", type=float, nargs=2, metavar=("NS", "EW"), default=None,
-        help="benchmark against the intersection's current plan (green seconds per phase)",
+        help="single-intersection mode: benchmark the current plan (green s per phase)",
     )
     args = parser.parse_args()
-    current = FixedTimePlan(greens=tuple(args.current_greens)) if args.current_greens else None
-    optimize_from_counts(
-        args.data, runs=args.runs, seed=args.seed, out_dir=args.out,
-        current_plan=current, include_rl=not args.no_rl,
-    )
+
+    from traffic_rl.data import is_corridor_csv
+
+    if is_corridor_csv(args.data):
+        optimize_corridor_from_counts(
+            args.data, runs=args.runs, seed=args.seed, out_dir=args.out,
+            link_travel=args.link_travel, include_rl=not args.no_rl,
+        )
+    else:
+        current = (
+            FixedTimePlan(greens=tuple(args.current_greens)) if args.current_greens else None
+        )
+        optimize_from_counts(
+            args.data, runs=args.runs, seed=args.seed, out_dir=args.out,
+            current_plan=current, include_rl=not args.no_rl,
+        )
 
 
 if __name__ == "__main__":

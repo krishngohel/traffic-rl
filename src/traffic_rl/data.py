@@ -34,8 +34,7 @@ def _parse_time(value: str) -> float:
     return float(value)
 
 
-def load_counts_csv(path: Path | str) -> tuple[DemandSchedule, float]:
-    """Returns (demand schedule re-based to t=0, total duration in seconds)."""
+def _read_rows(path: Path | str) -> list[dict]:
     with open(path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     if not rows:
@@ -44,12 +43,15 @@ def load_counts_csv(path: Path | str) -> tuple[DemandSchedule, float]:
     if missing:
         raise ValueError(
             f"{path}: missing required columns {missing}; expected "
-            f"time,{','.join(VEH_COLUMNS)}[,{','.join(PED_COLUMNS)}]"
+            f"time[,node],{','.join(VEH_COLUMNS)}[,{','.join(PED_COLUMNS)}]"
         )
+    return rows
 
+
+def _schedule_from_rows(rows: list[dict], label: str) -> tuple[DemandSchedule, float]:
     starts = [_parse_time(r["time"]) for r in rows]
     if any(b <= a for a, b in zip(starts, starts[1:], strict=False)):
-        raise ValueError(f"{path}: 'time' must be strictly increasing")
+        raise ValueError(f"{label}: 'time' must be strictly increasing")
     # Interval lengths: gap to the next row; the final interval reuses the
     # previous length (or 1 h for a single-row file).
     lengths = [b - a for a, b in zip(starts, starts[1:], strict=False)]
@@ -62,3 +64,38 @@ def load_counts_csv(path: Path | str) -> tuple[DemandSchedule, float]:
         ped = tuple(float(row.get(c) or 0.0) / hours for c in PED_COLUMNS)
         schedule.append((start - starts[0], DemandConfig(vehicle_rates=veh, ped_rates=ped)))
     return tuple(schedule), float(sum(lengths))
+
+
+def is_corridor_csv(path: Path | str) -> bool:
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        header = next(csv.reader(f), [])
+    return "node" in [h.strip() for h in header]
+
+
+def load_counts_csv(path: Path | str) -> tuple[DemandSchedule, float]:
+    """Single intersection. Returns (schedule re-based to t=0, duration s)."""
+    return _schedule_from_rows(_read_rows(path), str(path))
+
+
+def load_corridor_counts_csv(path: Path | str) -> tuple[list[DemandSchedule], float, int]:
+    """Corridor CSV: same columns plus `node` (0 = west-most intersection,
+    increasing eastward). Every node must report the same time intervals.
+    Returns (per-node schedules, duration s, n_nodes)."""
+    rows = _read_rows(path)
+    if "node" not in rows[0]:
+        raise ValueError(f"{path}: corridor data needs a 'node' column")
+    by_node: dict[int, list[dict]] = {}
+    for row in rows:
+        by_node.setdefault(int(row["node"]), []).append(row)
+    n_nodes = len(by_node)
+    if sorted(by_node) != list(range(n_nodes)):
+        raise ValueError(f"{path}: 'node' must cover 0..{n_nodes - 1}, got {sorted(by_node)}")
+    times = [tuple(r["time"] for r in by_node[i]) for i in range(n_nodes)]
+    if any(t != times[0] for t in times[1:]):
+        raise ValueError(f"{path}: every node must report the same time intervals")
+    schedules, durations = [], []
+    for i in range(n_nodes):
+        schedule, duration = _schedule_from_rows(by_node[i], f"{path} node {i}")
+        schedules.append(schedule)
+        durations.append(duration)
+    return schedules, durations[0], n_nodes

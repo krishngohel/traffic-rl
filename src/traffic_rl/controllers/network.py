@@ -126,6 +126,49 @@ class GreenWaveController(NetworkController):
             self._coordinated.append(controller)
 
 
+@dataclasses.dataclass(frozen=True)
+class CoordinatedPlan:
+    """One coordination timing sheet: a common cycle with per-node splits and
+    offsets (all plans share the cycle by construction)."""
+
+    node_plans: tuple[FixedTimePlan, ...]
+    offsets: tuple[float, ...]
+    scheme: str = ""  # "east" / "west" / "zero" wave, for reporting
+
+    def cycle(self, yellow: float, all_red: float) -> float:
+        return self.node_plans[0].cycle(yellow, all_red)
+
+
+class ScheduledCoordinatedController(NetworkController):
+    """Time-of-day coordinated control: a CoordinatedPlan per schedule interval
+    — what a corridor retiming study installs."""
+
+    name = "coordinated"
+
+    def __init__(self, plans: list[tuple[float, CoordinatedPlan]]):
+        self.plans = sorted(plans, key=lambda p: p[0])
+
+    def reset(self, config: NetworkConfig, rng: np.random.Generator) -> None:
+        self._by_interval: list[tuple[float, list[_OffsetFixedTime]]] = []
+        for start, coord in self.plans:
+            controllers = []
+            for i in range(config.n_nodes):
+                c = _OffsetFixedTime(coord.node_plans[i], coord.offsets[i])
+                c.reset(config.node_config(i), rng)
+                controllers.append(c)
+            self._by_interval.append((start, controllers))
+
+    def act(self, observations: list[Observation]) -> list[int]:
+        t = observations[0].t
+        active = self._by_interval[0][1]
+        for start, controllers in self._by_interval:
+            if start <= t:
+                active = controllers
+            else:
+                break
+        return [c.act(o) for c, o in zip(active, observations, strict=True)]
+
+
 class NetworkMaxPressureController(NetworkController):
     name = "max_pressure_net"
 

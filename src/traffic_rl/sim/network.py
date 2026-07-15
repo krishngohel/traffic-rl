@@ -44,7 +44,12 @@ class NetworkDemandConfig:
 
 @dataclass(frozen=True)
 class NetworkConfig:
-    demand: NetworkDemandConfig
+    demand: NetworkDemandConfig | None = None  # uniform corridor demand...
+    # ...or per-node demand (e.g. from real count data). Exactly one required.
+    # Only the externally-fed rates matter per node (N/S everywhere, W at node
+    # 0, E at the last node); internal arterial approaches are fed by links.
+    node_demands: tuple[DemandConfig, ...] | None = None
+    node_schedules: tuple | None = None  # per-node DemandSchedule, optional
     n_nodes: int = 4
     link_travel: float = 20.0  # seconds between adjacent intersections
     timing: SignalTimingConfig = field(default_factory=SignalTimingConfig)
@@ -61,9 +66,11 @@ class NetworkConfig:
         return round(self.horizon / self.dt)
 
     def node_config(self, i: int) -> SimConfig:
-        d = self.demand
-        return SimConfig(
-            demand=DemandConfig(
+        if self.node_demands is not None:
+            node_demand = self.node_demands[i]
+        elif self.demand is not None:
+            d = self.demand
+            node_demand = DemandConfig(
                 vehicle_rates=(
                     d.cross,
                     d.cross,
@@ -71,11 +78,16 @@ class NetworkConfig:
                     d.arterial_east if i == 0 else 0.0,
                 ),
                 ped_rates=(d.peds, d.peds),
-            ),
+            )
+        else:
+            raise ValueError("NetworkConfig needs either demand or node_demands")
+        return SimConfig(
+            demand=node_demand,
             timing=self.timing,
             dt=self.dt,
             warmup=self.warmup,
             measured=self.measured,
+            demand_schedule=self.node_schedules[i] if self.node_schedules else None,
             external_vehicle_arrivals=(
                 True,
                 True,

@@ -130,6 +130,23 @@ hardware would buy (actuated: 34.3 s). Projections inherit the model's stated
 limits — point-queue, no turning movements — so treat them as a screening
 study, not a signed-off timing sheet.
 
+**Whole corridors too:** add a `node` column (0 = west-most signal, increasing
+eastward) with counts for every intersection, and the same command retimes the
+arterial — coordinated time-of-day plans with a common cycle, per-node Webster
+splits, and progression offsets chosen by simulation (eastbound wave, westbound
+wave, or simultaneous, per interval):
+
+```powershell
+traffic-rl-optimize corridor_counts.csv --link-travel 20
+```
+
+On the bundled 3-intersection example (`examples/corridor_counts_example.csv`,
+a westbound AM rush) it correctly picks a **westbound** progression for the
+peak interval and cuts journey p95 (the sum of a vehicle's waits along the
+whole corridor) from an unstable **≥ 790 s** under uncoordinated naive timing
+to **74 s** — with the adaptive references (actuated 61 s, shared RL 62 s)
+reported alongside.
+
 ## Phase 3: four intersections — coordination changes the story
 
 A corridor of 4 signals on an EW arterial (link travel 20 s): eastbound and
