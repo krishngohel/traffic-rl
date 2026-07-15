@@ -7,9 +7,17 @@ up. This project tests whether better signal control actually fixes that —
 starting with an honest simulator and the four classic strategies traffic
 engineers already use, so anything built later has real opponents to beat.
 
-**Phase 2 verdict, up front: the RL agent did not beat the classics — and that
-result is published here, not buried.** Details below; the one place it
-genuinely wins is near saturation.
+**Phase 2 verdict, up front: at a single intersection the RL agent did not beat
+the classics — and that result is published here, not buried.** Details below;
+the one place it genuinely wins is near saturation. **Phase 3 moves to a
+corridor of four intersections**, where the story shifts: the shared RL policy
+beats every *coordination* classic (green wave, network max-pressure) and
+statistically ties actuated on the rush corridor.
+
+**This is also a practical tool**: point `traffic-rl-optimize` at a CSV of real
+intersection counts and it returns optimized time-of-day signal plans with a
+simulated, CI-backed projection of the wait-time reduction. See "Optimize a
+real intersection" below.
 
 ## Phase 1 results
 
@@ -93,6 +101,71 @@ The simulator runs **~40,000x real time** (a full sim-hour in well under a
 second of wall clock; the entire 12-experiment, 240-run evaluation takes about
 a minute).
 
+## Optimize a real intersection from count data
+
+Feed the tool a standard intersection count study — per-approach volumes per
+interval, the data cities already collect:
+
+```csv
+time,north_veh,south_veh,east_veh,west_veh,ped_ns,ped_ew
+07:00,560,540,180,170,35,30
+08:00,640,610,210,190,45,40
+09:00,420,400,180,170,30,25
+```
+
+```powershell
+traffic-rl-optimize counts.csv --runs 10
+# benchmark against your intersection's current plan:
+traffic-rl-optimize counts.csv --current-greens 25 25
+```
+
+It computes a Webster plan per interval, refines each with a paired-seed local
+search over cycle and split, assembles time-of-day plans, and evaluates them
+against baselines on the full demand profile. Output: `report.md` /
+`report.json` (the recommended plans plus a CI-backed comparison) and
+`comparison.png`. On the bundled example (`examples/counts_example.csv`, a
+5-hour AM-peak profile) the recommended plans cut p95 wait **58%** vs a naive
+50/50 signal (42.7 s vs 102.8 s); the report also shows what detection
+hardware would buy (actuated: 34.3 s). Projections inherit the model's stated
+limits — point-queue, no turning movements — so treat them as a screening
+study, not a signed-off timing sheet.
+
+## Phase 3: four intersections — coordination changes the story
+
+A corridor of 4 signals on an EW arterial (link travel 20 s): eastbound and
+westbound traffic traverses every signal, cross streets enter locally, and a
+vehicle's wait is the **sum of its queue waits along the whole journey**.
+Through-traffic only, no spillback between nodes — stated limits.
+
+| journey p95 (s), 20 paired seeds | corridor | corridor_rush | corridor_cross |
+|---|---|---|---|
+| Naive 50/50 (uncoordinated) | ≥ 283 | ≥ 1221 (all runs unstable) | 165 |
+| Green wave (coordinated Webster + offsets) | 81 | 116 | 101 |
+| Max-pressure (downstream-aware) | 125 | 255 | 121 |
+| Actuated (independent) | **70** | 86 | **73** |
+| **RL (shared policy)** | 75 | **84** | 79 |
+
+![Network p95](docs/charts/network/p95_bar.png)
+
+Three honest findings:
+
+1. **Uncoordinated fixed time is catastrophic at network scale** — queues
+   compound across signals until the corridor is fully unstable at rush.
+2. **The shared RL policy beats every coordination method.** One set of
+   weights runs all four intersections, seeing only local state plus the two
+   downstream arterial queues. It beats the green wave and network
+   max-pressure on all three corridors, and vs actuated the gap narrows from
+   ~30% at one intersection to ~7%: −4.6 s [−6.2, −3.0] on `corridor`,
+   −6.1 s [−7.8, −4.3] on `corridor_cross` (where it serves pedestrians
+   *better*), and a statistical tie on `corridor_rush` (+1.5 s [−1.2, +4.1]).
+3. **Actuated still holds the crown.** Local adaptation with three tuned
+   parameters remains unbeaten overall. Max-pressure's poor showing comes with
+   a caveat: its optimality theory is about spillback-constrained networks,
+   which this model deliberately omits.
+
+Train the corridor policy yourself: `python -m traffic_rl.rl.train_network`.
+Evaluate: `traffic-rl-eval-network`.
+
 ## Quickstart
 
 ```powershell
@@ -158,11 +231,13 @@ truncate a walk phase, or starve an approach past the backstop.
 
 ```
 src/traffic_rl/
-├── sim/          # IntersectionSim, SignalStateMachine, queues, arrivals
-├── controllers/  # naive 50/50, Webster, actuated, max-pressure, rl (+ base API)
-├── rl/           # NumPy double-DQN, trainer, trained weights, Gymnasium wrapper
-├── eval/         # metrics (the honesty rules), harness, charts
-└── viewer/       # live 3D pygame viewer
+├── sim/          # IntersectionSim, SignalStateMachine, queues, arrivals, NetworkSim
+├── controllers/  # naive, Webster, actuated, max-pressure, rl; network: green wave, ...
+├── rl/           # NumPy double-DQN, trainers, trained weights, Gymnasium wrapper
+├── eval/         # metrics (the honesty rules), harnesses, charts
+├── viewer/       # live 3D pygame viewer
+├── data.py       # real traffic-count CSV -> demand schedule
+└── optimize.py   # traffic-rl-optimize: signal retiming from real counts
 ```
 
 MIT license. Built as the Phase 1 floor for an open RL-for-traffic experiment.

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "traffic-rl"
-version = "0.2.0"
+version = "0.3.0"
 description = "Single-intersection traffic-signal microsimulator with classic baseline controllers and an honest evaluation harness"
 readme = "README.md"
 license = { text = "MIT" }
@@ -28,6 +28,8 @@ traffic-rl-eval = "traffic_rl.eval.harness:main"
 traffic-rl-charts = "traffic_rl.eval.charts:main"
 traffic-rl-watch = "traffic_rl.viewer.app:main"
 traffic-rl-train = "traffic_rl.rl.train:main"
+traffic-rl-optimize = "traffic_rl.optimize:main"
+traffic-rl-eval-network = "traffic_rl.eval.network_harness:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/traffic_rl"]

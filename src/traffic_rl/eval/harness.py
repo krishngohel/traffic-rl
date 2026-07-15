@@ -40,9 +40,9 @@ def run_seeds(base_seed: int, n_runs: int) -> list[int]:
     return [int(s) for s in np.random.SeedSequence(base_seed).generate_state(n_runs)]
 
 
-def run_single(controller_name: str, config: SimConfig, seed: int) -> dict:
+def run_controller(controller, config: SimConfig, seed: int) -> dict:
+    """Run one controller instance for one seeded episode and score it."""
     sim = IntersectionSim(config)
-    controller = CONTROLLER_REGISTRY[controller_name]()
     obs = sim.reset(seed)
     controller.reset(config, np.random.default_rng(seed))
     for _ in range(config.n_steps):
@@ -50,6 +50,10 @@ def run_single(controller_name: str, config: SimConfig, seed: int) -> dict:
     metrics = compute_run_metrics(sim.event_log.finalize(), config)
     metrics["seed"] = seed
     return metrics
+
+
+def run_single(controller_name: str, config: SimConfig, seed: int) -> dict:
+    return run_controller(CONTROLLER_REGISTRY[controller_name](), config, seed)
 
 
 def run_experiment(

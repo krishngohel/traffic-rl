@@ -43,6 +43,21 @@ class DemandConfig:
     ped_rates: tuple[float, float]  # peds/h per movement (with-NS, with-EW)
 
 
+# Time-varying demand: (start_second, DemandConfig) breakpoints, sorted ascending.
+# The demand in force at time t is the last breakpoint with start <= t.
+DemandSchedule = tuple[tuple[float, DemandConfig], ...]
+
+
+def demand_at(schedule: DemandSchedule, t: float) -> DemandConfig:
+    current = schedule[0][1]
+    for start, demand in schedule:
+        if start <= t:
+            current = demand
+        else:
+            break
+    return current
+
+
 @dataclass(frozen=True)
 class SimConfig:
     demand: DemandConfig
@@ -51,6 +66,13 @@ class SimConfig:
     sat_flow: float = 1800.0 / 3600.0  # veh/s per lane group
     warmup: float = 1200.0  # Webster: 900 s observe + 300 s settle; identical for all
     measured: float = 3600.0
+    # Optional time-varying demand (e.g. loaded from real count data). When set
+    # it overrides `demand` for arrival generation; `demand` remains the
+    # fallback/summary value.
+    demand_schedule: DemandSchedule | None = None
+    # Approaches that generate their own Poisson arrivals. A network sim sets
+    # internal approaches to False and feeds them by injection instead.
+    external_vehicle_arrivals: tuple[bool, bool, bool, bool] = (True, True, True, True)
 
     @property
     def horizon(self) -> float:

@@ -21,13 +21,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-CONTROLLER_ORDER = ["naive", "webster", "actuated", "max_pressure", "rl"]
+CONTROLLER_ORDER = ["naive", "webster", "actuated", "max_pressure", "rl", "greenwave"]
 LABELS = {
     "naive": "Naive 50/50",
     "webster": "Webster (1958)",
     "actuated": "Actuated",
     "max_pressure": "Max-pressure",
     "rl": "RL (DQN)",
+    "greenwave": "Green wave",
 }
 SERIES = {  # validated categorical palette, fixed slot order
     "naive": "#2a78d6",
@@ -35,6 +36,7 @@ SERIES = {  # validated categorical palette, fixed slot order
     "actuated": "#eda100",
     "max_pressure": "#008300",
     "rl": "#4a3aa7",
+    "greenwave": "#e34948",
 }
 SURFACE = "#fcfcfb"
 INK = "#0b0b0b"
@@ -65,12 +67,14 @@ plt.rcParams.update(
 )
 
 
+_SCENARIO_ORDER = ["symmetric", "asymmetric", "heavy", "corridor", "corridor_rush",
+                   "corridor_cross"]
+
+
 def _load(results: Path):
     scenarios = sorted(
         (p.name for p in results.iterdir() if (p / "summary.json").exists()),
-        key=lambda s: ["symmetric", "asymmetric", "heavy"].index(s)
-        if s in ("symmetric", "asymmetric", "heavy")
-        else 99,
+        key=lambda s: _SCENARIO_ORDER.index(s) if s in _SCENARIO_ORDER else 99,
     )
     data = {}
     for s in scenarios:
@@ -179,7 +183,8 @@ def chart_queue_timeseries(scenarios, data, results: Path, out: Path):
             q = np.apply_along_axis(
                 lambda r, k=kernel: np.convolve(r, k, mode="valid"), 1, q
             )
-            t = (np.arange(q.shape[1]) + 60 + data[s]["config"]["warmup"]) / 60.0
+            warmup = data[s]["config"].get("warmup", 1200.0)
+            t = (np.arange(q.shape[1]) + 60 + warmup) / 60.0
             mean, std = q.mean(axis=0), q.std(axis=0)
             color = SERIES.get(c, MUTED)
             ax.plot(t, mean, color=color, lw=2, label=LABELS.get(c, c))

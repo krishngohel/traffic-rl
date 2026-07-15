@@ -4,7 +4,7 @@ from traffic_rl.config import DemandConfig, SignalTimingConfig, SimConfig
 from traffic_rl.controllers.base import Controller, Observation, StepResult
 from traffic_rl.sim.core import IntersectionSim
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "Controller",

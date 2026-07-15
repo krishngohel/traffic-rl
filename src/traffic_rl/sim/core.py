@@ -62,7 +62,7 @@ class IntersectionSim:
     def reset(self, seed: int) -> Observation:
         cfg = self.config
         self.t = 0.0
-        self.streams = ArrivalStreams(seed, cfg.demand, cfg.dt)
+        self.streams = ArrivalStreams(seed, cfg.demand, cfg.dt, schedule=cfg.demand_schedule)
         self.signal = SignalStateMachine(cfg.timing)
         self.queues = [
             ApproachQueue(cfg.sat_flow, cfg.timing.startup_lost) for _ in range(N_APPROACHES)
@@ -71,8 +71,14 @@ class IntersectionSim:
         self.waiting_peds: list[list[int]] = [[] for _ in range(N_PED_MOVEMENTS)]
         self.log = EventLog()
         self._last_arrival_counts = np.zeros(N_APPROACHES, dtype=np.int64)
+        self._pending_injections = [0] * N_APPROACHES
         self._has_reset = True
         return self._observe()
+
+    def inject_vehicles(self, approach: int, count: int) -> None:
+        """Queue vehicles (e.g. arriving from an upstream intersection) to enter
+        the given approach during the next step's arrivals phase."""
+        self._pending_injections[approach] += count
 
     @property
     def event_log(self) -> EventLog:
@@ -101,18 +107,26 @@ class IntersectionSim:
         if events.walk_started is not None:
             self._serve_walk(events.walk_started, t_new)
 
-        # 3. Arrivals.
-        veh_counts = self.streams.vehicle_counts()
+        # 3. Arrivals (rates may be time-varying under a demand schedule).
+        # Poisson draws happen for every approach (keeps streams aligned across
+        # configs), but masked approaches discard theirs and are fed by
+        # injection from upstream instead. Order per approach: external first,
+        # then injected — the network mirror relies on this FIFO order.
+        veh_counts = self.streams.vehicle_counts(self.t)
+        arrivals = np.zeros(N_APPROACHES, dtype=np.int64)
         for a in range(N_APPROACHES):
-            for _ in range(int(veh_counts[a])):
+            external = int(veh_counts[a]) if cfg.external_vehicle_arrivals[a] else 0
+            for _ in range(external + self._pending_injections[a]):
                 veh_id = len(self.log.veh_arrival)
                 self.log.veh_arrival.append(t_new)
                 self.log.veh_depart.append(np.nan)
                 self.log.veh_approach.append(a)
                 self.queues[a].add(veh_id, t_new)
-        self._last_arrival_counts = veh_counts
+            arrivals[a] = external + self._pending_injections[a]
+            self._pending_injections[a] = 0
+        self._last_arrival_counts = arrivals
 
-        ped_counts = self.streams.ped_counts()
+        ped_counts = self.streams.ped_counts(self.t)
         for m in range(N_PED_MOVEMENTS):
             for _ in range(int(ped_counts[m])):
                 ped_id = len(self.log.ped_arrival)
@@ -127,11 +141,13 @@ class IntersectionSim:
 
         # 4. Discharge on green.
         departures = 0
+        departures_by_approach = np.zeros(N_APPROACHES, dtype=np.int64)
         if self.signal.state == SignalState.GREEN:
             for a in PHASE_APPROACHES[self.signal.phase]:
                 for veh_id in self.queues[a].discharge(self.signal.state_elapsed, dt):
                     self.log.veh_depart[veh_id] = t_new
                     departures += 1
+                    departures_by_approach[a] += 1
 
         # 5. Bookkeeping.
         queue_lengths = tuple(len(q) for q in self.queues)
@@ -147,6 +163,8 @@ class IntersectionSim:
         info = {
             "t": t_new,
             "departures_this_step": departures,
+            "departures_by_approach": departures_by_approach,
+            "arrivals_by_approach": arrivals,
             "total_queue": total_queue,
             "wait_accrued_this_step": total_queue * dt,
             "peds_waiting": peds_waiting,
