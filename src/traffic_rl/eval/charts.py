@@ -21,18 +21,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-CONTROLLER_ORDER = ["naive", "webster", "actuated", "max_pressure"]
+CONTROLLER_ORDER = ["naive", "webster", "actuated", "max_pressure", "rl"]
 LABELS = {
     "naive": "Naive 50/50",
     "webster": "Webster (1958)",
     "actuated": "Actuated",
     "max_pressure": "Max-pressure",
+    "rl": "RL (DQN)",
 }
 SERIES = {  # validated categorical palette, fixed slot order
     "naive": "#2a78d6",
     "webster": "#1baf7a",
     "actuated": "#eda100",
     "max_pressure": "#008300",
+    "rl": "#4a3aa7",
 }
 SURFACE = "#fcfcfb"
 INK = "#0b0b0b"

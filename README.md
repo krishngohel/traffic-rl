@@ -5,9 +5,11 @@
 We have all sat at a red light on an empty road while the busy direction backs
 up. This project tests whether better signal control actually fixes that —
 starting with an honest simulator and the four classic strategies traffic
-engineers already use, so anything built later (Phase 2: a reinforcement-learning
-agent) has real opponents to beat. If the RL agent cannot beat the classics,
-that gets published as a negative result, not a buried one.
+engineers already use, so anything built later has real opponents to beat.
+
+**Phase 2 verdict, up front: the RL agent did not beat the classics — and that
+result is published here, not buried.** Details below; the one place it
+genuinely wins is near saturation.
 
 ## Phase 1 results
 
@@ -105,25 +107,62 @@ The viewer (`pygame-ce`) shows live queues, signal heads, and pedestrian walk
 phases at 1x–1024x. Keys: `Space` pause · `+`/`-` speed · `R` new seed · `Esc`
 quit.
 
-## Phase 2: the RL interface is already here
+## Phase 2: the RL agent — an honest negative result
+
+A double-DQN (pure NumPy: 22→64→64→2, replay, target network, action masking —
+no GPU, no framework, fully seeded) was trained for 1.5M steps on **randomized
+demand** (per-approach 100–650 veh/h, peds 20–90/h): one policy, no
+per-scenario tuning, reward = −(vehicle + pedestrian) waiting per second, so it
+cannot win by starving crosswalks. Evaluated by the identical harness, seeds,
+and metrics as the classics.
+
+| p95 wait (s), paired vs actuated | symmetric | asymmetric | heavy |
+|---|---|---|---|
+| Actuated (best classic) | **37.8** | **35.5** | 50.8 |
+| RL (DQN) | 48.2 | 46.8 | **49.3** |
+| Paired Δ (act − RL), 95% CI | −10.4 [−11.3, −9.4] | −11.3 [−12.4, −10.3] | **+1.5 [+0.3, +2.7]** |
+
+**The verdict:** the RL agent beats naive everywhere and Webster on the hard
+scenarios, but a 1960s-era vehicle-actuated controller with three parameters
+beats it decisively on two of three scenarios, and it costs pedestrians more
+(ped p95 63–74 s vs actuated's 47–49 s) except on heavy. Its one statistically
+significant win is the near-saturation scenario (+1.5 s p95 over actuated,
+with better ped waits there too) — plausibly because saturation is where
+myopic gap-out logic wastes capacity and value estimation helps.
+
+Fairness both ways: the classics got a parameter sweep, so the agent got a
+serious retry (3M steps, 128-wide net, γ=0.995, slower exploration decay) — it
+came out *worse* on asymmetric (68.7 s). The shipped weights are the better
+first run. Things not yet tried that might flip this: longer training with
+prioritized replay, a recurrent policy, reward shaping on p95 rather than mean
+wait, or multi-intersection settings (where max-pressure's theory shines and
+hand-tuned controllers coordinate poorly — likely the more interesting fight).
+
+Train your own: `traffic-rl-train` (~3 minutes on a laptop, deterministic per
+seed). The optional Gymnasium wrapper (`pip install traffic-rl[rl]`,
+`traffic_rl.rl.env.TrafficEnv`) exists so you can point stable-baselines3 or
+any Gym-compatible library at the same sim.
+
+### The RL interface
 
 The sim core *is* the environment: `reset(seed) -> Observation`,
 `step(action) -> StepResult`. `Observation` is fixed-size numeric arrays (flattens
 straight into a Gymnasium `Box`), `StepResult.info` carries per-step reward
-ingredients (`wait_accrued_this_step`, `departures_this_step`, `total_queue`),
-and `action_mask` exposes which phases are legal. A Gymnasium wrapper needs
-zero changes to the core — and the signal state machine means a half-trained
-policy still cannot run a yellow, truncate a walk phase, or starve an approach
-past the backstop.
+ingredients (`wait_accrued_this_step`, `ped_wait_accrued_this_step`,
+`departures_this_step`, `total_queue`), and `action_mask` exposes which phases
+are legal. The Gymnasium wrapper needed zero changes to the core — and the
+signal state machine means a half-trained policy still cannot run a yellow,
+truncate a walk phase, or starve an approach past the backstop.
 
 ## Layout
 
 ```
 src/traffic_rl/
 ├── sim/          # IntersectionSim, SignalStateMachine, queues, arrivals
-├── controllers/  # naive 50/50, Webster, actuated, max-pressure (+ base API)
+├── controllers/  # naive 50/50, Webster, actuated, max-pressure, rl (+ base API)
+├── rl/           # NumPy double-DQN, trainer, trained weights, Gymnasium wrapper
 ├── eval/         # metrics (the honesty rules), harness, charts
-└── viewer/       # live pygame viewer
+└── viewer/       # live 3D pygame viewer
 ```
 
 MIT license. Built as the Phase 1 floor for an open RL-for-traffic experiment.

@@ -11,11 +11,20 @@ from traffic_rl.controllers.fixed_time import (
 from traffic_rl.controllers.max_pressure import MaxPressureController
 from traffic_rl.controllers.webster import WebsterController, webster_plan
 
+
+def _rl_factory() -> Controller:
+    # Lazy import: keeps the RL package optional and avoids an import cycle.
+    from traffic_rl.rl.policy import RLController
+
+    return RLController()
+
+
 CONTROLLER_REGISTRY: dict[str, Callable[[], Controller]] = {
     "naive": NaiveController,
     "webster": WebsterController,
     "actuated": ActuatedController,
     "max_pressure": MaxPressureController,
+    "rl": _rl_factory,
 }
 
 __all__ = [

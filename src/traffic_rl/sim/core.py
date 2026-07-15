@@ -143,11 +143,14 @@ class IntersectionSim:
         self.t = t_new
 
         obs = self._observe()
+        peds_waiting = sum(len(w) for w in self.waiting_peds)
         info = {
             "t": t_new,
             "departures_this_step": departures,
             "total_queue": total_queue,
             "wait_accrued_this_step": total_queue * dt,
+            "peds_waiting": peds_waiting,
+            "ped_wait_accrued_this_step": peds_waiting * dt,
         }
         return StepResult(obs=obs, info=info)
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "traffic-rl"
-version = "0.1.0"
+version = "0.2.0"
 description = "Single-intersection traffic-signal microsimulator with classic baseline controllers and an honest evaluation harness"
 readme = "README.md"
 license = { text = "MIT" }
@@ -15,17 +15,19 @@ dependencies = ["numpy>=1.26"]
 [project.optional-dependencies]
 viewer = ["pygame-ce>=2.5"]
 charts = ["matplotlib>=3.8"]
+rl = ["gymnasium>=1.0"]
 dev = [
     "pytest>=8",
     "pytest-cov",
     "ruff",
-    "traffic-rl[viewer,charts]",
+    "traffic-rl[viewer,charts,rl]",
 ]
 
 [project.scripts]
 traffic-rl-eval = "traffic_rl.eval.harness:main"
 traffic-rl-charts = "traffic_rl.eval.charts:main"
 traffic-rl-watch = "traffic_rl.viewer.app:main"
+traffic-rl-train = "traffic_rl.rl.train:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/traffic_rl"]
