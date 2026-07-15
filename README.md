@@ -7,17 +7,22 @@ up. This project tests whether better signal control actually fixes that —
 starting with an honest simulator and the four classic strategies traffic
 engineers already use, so anything built later has real opponents to beat.
 
-**Phase 2 verdict, up front: at a single intersection the RL agent did not beat
-the classics — and that result is published here, not buried.** Details below;
-the one place it genuinely wins is near saturation. **Phase 3 moves to a
-corridor of four intersections**, where the story shifts: the shared RL policy
-beats every *coordination* classic (green wave, network max-pressure) and
-statistically ties actuated on the rush corridor.
+**The current verdict, up front: machine learning now holds the crown — but it
+took three honest attempts to get there.** The first RL agent lost to a 1960s
+actuated controller and that negative result was published, not buried (Phase
+2, below). At corridor scale the gap narrowed to a tie (Phase 3). The
+breakthrough was **pattern awareness** (Phase 4): giving the policy learned
+estimates of the demand pattern itself — the thing no gap detector can see —
+and training it on time-varying traffic so anticipation pays. The
+pattern-aware policy now **beats the champion actuated controller with
+statistical significance on two of three scenarios and ties it on the third,
+never losing, while serving pedestrians better on two of three.**
 
 **This is also a practical tool**: point `traffic-rl-optimize` at a CSV of real
-intersection counts and it returns optimized time-of-day signal plans with a
-simulated, CI-backed projection of the wait-time reduction. See "Optimize a
-real intersection" below.
+intersection counts and it returns optimized time-of-day signal plans — and,
+with `--train-site`, a site-tuned ML policy — with simulated, CI-backed
+projections of the wait-time reduction. See "Optimize a real intersection"
+below.
 
 ## Phase 1 results
 
@@ -130,6 +135,13 @@ hardware would buy (actuated: 34.3 s). Projections inherit the model's stated
 limits — point-queue, no turning movements — so treat them as a screening
 study, not a signed-off timing sheet.
 
+**Train the ML on your site's patterns:** `--train-site` fine-tunes the
+pattern-aware policy on demand sampled around your data (random windows of
+your day, scaled and jittered), starting from the shipped general weights, and
+adds it to the comparison as `rl_site_trained`. On the bundled example the
+general pattern policy already ties actuated (34.6 vs 34.3 s), so site tuning
+mainly matters for demand outside the general training range.
+
 **Whole corridors too:** add a `node` column (0 = west-most signal, increasing
 eastward) with counts for every intersection, and the same command retimes the
 arterial — coordinated time-of-day plans with a common cycle, per-node Webster
@@ -146,6 +158,41 @@ peak interval and cuts journey p95 (the sum of a vehicle's waits along the
 whole corridor) from an unstable **≥ 790 s** under uncoordinated naive timing
 to **74 s** — with the adaptive references (actuated 61 s, shared RL 62 s)
 reported alongside.
+
+## Phase 4: pattern-aware ML — the first controller to beat the classics
+
+The insight, extracted from two rounds of losing: every controller in this
+project — including the first DQN — decided from a snapshot. Queue lengths
+now, gaps now. But traffic has *patterns*: rushes build, quiet hours drain,
+and knowing which regime you are in changes the right decision. Real actuated
+hardware cannot see this; a learned controller can.
+
+The pattern-aware recipe (`traffic-rl-train --pattern`):
+
+- **Pattern features**: exponential moving estimates of each approach's
+  arrival RATE at two time constants (~1 min and ~15 min), computed from the
+  same detector pulses real hardware has (`rl/patterns.py`). The policy sees
+  "what is happening" *and* "what kind of hour this is".
+- **Training where anticipation pays**: half the episodes have piecewise
+  time-varying demand (three regimes per episode), so exploiting the pattern
+  features is rewarded during learning.
+- **A stronger learner**: n-step returns (n=5), a wider net (96), 3M steps —
+  still pure NumPy, still fully seeded, trained in ~7 minutes on a laptop.
+
+Result, 20 paired seeds, the same harness that judged everything else:
+
+| p95 wait (s) | symmetric | asymmetric | heavy |
+|---|---|---|---|
+| Actuated (previous champion) | 37.8 | 35.5 | 50.8 |
+| **RL pattern-aware** | **35.4** | **35.2** | **48.2** |
+| Paired Δ (act − RL), 95% CI | **+2.4 [+1.7, +3.1]** | +0.3 [−0.3, +0.8] | **+2.7 [+2.0, +3.3]** |
+
+Two significant wins, one statistical tie, zero losses — with mean waits also
+lower everywhere and pedestrian p95 better on symmetric (43 vs 47 s) and heavy
+(62 vs 70 s), slightly worse on asymmetric (51 vs 49 s). On the real-data
+example profile it ties actuated (34.6 vs 34.3 s) — without ever seeing that
+data. This is the project's thesis, finally earned: **learning the traffic
+pattern, not just reacting to it, is worth real seconds per person.**
 
 ## Phase 3: four intersections — coordination changes the story
 

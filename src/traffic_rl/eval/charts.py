@@ -21,7 +21,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
-CONTROLLER_ORDER = ["naive", "webster", "actuated", "max_pressure", "rl", "greenwave"]
+CONTROLLER_ORDER = [
+    "naive", "webster", "actuated", "max_pressure", "rl", "greenwave", "rl_pattern",
+]
 LABELS = {
     "naive": "Naive 50/50",
     "webster": "Webster (1958)",
@@ -29,6 +31,7 @@ LABELS = {
     "max_pressure": "Max-pressure",
     "rl": "RL (DQN)",
     "greenwave": "Green wave",
+    "rl_pattern": "RL pattern-aware",
 }
 SERIES = {  # validated categorical palette, fixed slot order
     "naive": "#2a78d6",
@@ -37,6 +40,7 @@ SERIES = {  # validated categorical palette, fixed slot order
     "max_pressure": "#008300",
     "rl": "#4a3aa7",
     "greenwave": "#e34948",
+    "rl_pattern": "#e87ba4",
 }
 SURFACE = "#fcfcfb"
 INK = "#0b0b0b"
@@ -109,7 +113,12 @@ def _bar_panel(ax, summary: dict, metric: str, flag_key: str | None):
             color=INK,
         )
     ax.set_xticks(range(len(controllers)))
-    ax.set_xticklabels([LABELS.get(c, c) for c in controllers], fontsize=8.5)
+    ax.set_xticklabels(
+        [LABELS.get(c, c) for c in controllers],
+        fontsize=8.5,
+        rotation=22 if len(controllers) > 4 else 0,
+        ha="right" if len(controllers) > 4 else "center",
+    )
     ax.set_title(summary["scenario"], fontsize=11, color=INK, pad=10)
     ax.grid(axis="x", visible=False)
     ax.margins(y=0.15)

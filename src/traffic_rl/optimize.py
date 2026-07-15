@@ -24,7 +24,13 @@ from pathlib import Path
 
 import numpy as np
 
-from traffic_rl.config import DemandConfig, DemandSchedule, SignalTimingConfig, SimConfig
+from traffic_rl.config import (
+    DemandConfig,
+    DemandSchedule,
+    SignalTimingConfig,
+    SimConfig,
+    demand_at,
+)
 from traffic_rl.controllers import CONTROLLER_REGISTRY
 from traffic_rl.controllers.fixed_time import (
     FixedTimeController,
@@ -96,6 +102,27 @@ def _average_demand(schedule: DemandSchedule, duration: float) -> DemandConfig:
     return DemandConfig(vehicle_rates=tuple(veh), ped_rates=tuple(ped))
 
 
+def site_episode_factory(schedule: DemandSchedule, duration: float):
+    """Training episodes sampled AROUND the site's measured pattern: a random
+    30-minute window of the day, with the rates scaled and jittered so the
+    policy learns the site's shape without memorizing one exact profile."""
+
+    def factory(rng: np.random.Generator) -> SimConfig:
+        t0 = rng.uniform(0.0, max(duration - 1800.0, 1.0))
+        scale = rng.uniform(0.8, 1.25)
+        jitter = rng.uniform(0.9, 1.1, size=4)
+        regimes = []
+        for k in range(3):
+            d = demand_at(schedule, min(t0 + 600.0 * k, duration - 1.0))
+            veh = tuple(float(v) * scale * j for v, j in zip(d.vehicle_rates, jitter, strict=True))
+            ped = tuple(float(p) * scale for p in d.ped_rates)
+            regimes.append(DemandConfig(vehicle_rates=veh, ped_rates=ped))
+        episode_schedule = tuple((600.0 * k, d) for k, d in enumerate(regimes))
+        return SimConfig(demand=regimes[0], demand_schedule=episode_schedule)
+
+    return factory
+
+
 def optimize_from_counts(
     csv_path: Path,
     runs: int = 10,
@@ -103,6 +130,7 @@ def optimize_from_counts(
     out_dir: Path = Path("results") / "optimize",
     current_plan: FixedTimePlan | None = None,
     include_rl: bool = True,
+    train_site_steps: int = 0,
 ) -> dict:
     schedule, duration = load_counts_csv(csv_path)
     if duration < MIN_EVAL_SECONDS + 900.0:
@@ -150,10 +178,25 @@ def optimize_from_counts(
     if current_plan is not None:
         contenders["current_plan"] = FixedTimeController(current_plan)
     if include_rl:
-        try:
-            contenders["rl"] = CONTROLLER_REGISTRY["rl"]()
-        except FileNotFoundError:
-            print("(no trained RL weights found — skipping rl contender)")
+        for name in ("rl", "rl_pattern"):
+            try:
+                contenders[name] = CONTROLLER_REGISTRY[name]()
+            except FileNotFoundError:
+                print(f"(no trained {name} weights found — skipping)")
+    if train_site_steps > 0:
+        from traffic_rl.rl.pattern_policy import PATTERN_WEIGHTS, PatternRLController
+        from traffic_rl.rl.train import train_pattern_policy
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        site_weights = out_dir / "site_weights.npz"
+        print(f"training site-specific policy ({train_site_steps:,} steps) ...")
+        train_pattern_policy(
+            train_site_steps, seed, site_weights,
+            episode_factory=site_episode_factory(schedule, duration),
+            log_prefix="  [site] ",
+            init_weights=PATTERN_WEIGHTS if PATTERN_WEIGHTS.exists() else None,
+        )
+        contenders["rl_site_trained"] = PatternRLController(weights=site_weights)
 
     results: dict[str, dict] = {}
     for name, controller in contenders.items():
@@ -575,11 +618,19 @@ def main() -> None:
         "--current-greens", type=float, nargs=2, metavar=("NS", "EW"), default=None,
         help="single-intersection mode: benchmark the current plan (green s per phase)",
     )
+    parser.add_argument(
+        "--train-site", type=int, nargs="?", const=600_000, default=0, metavar="STEPS",
+        help="single-intersection mode: also TRAIN a site-specific ML policy on demand "
+        "patterns sampled around this data (default 600k steps, ~2 min) and include it "
+        "in the comparison",
+    )
     args = parser.parse_args()
 
     from traffic_rl.data import is_corridor_csv
 
     if is_corridor_csv(args.data):
+        if args.train_site:
+            parser.error("--train-site currently supports single-intersection data only")
         optimize_corridor_from_counts(
             args.data, runs=args.runs, seed=args.seed, out_dir=args.out,
             link_travel=args.link_travel, include_rl=not args.no_rl,
@@ -591,6 +642,7 @@ def main() -> None:
         optimize_from_counts(
             args.data, runs=args.runs, seed=args.seed, out_dir=args.out,
             current_plan=current, include_rl=not args.no_rl,
+            train_site_steps=args.train_site,
         )
 
 

@@ -19,12 +19,19 @@ def _rl_factory() -> Controller:
     return RLController()
 
 
+def _rl_pattern_factory() -> Controller:
+    from traffic_rl.rl.pattern_policy import PatternRLController
+
+    return PatternRLController()
+
+
 CONTROLLER_REGISTRY: dict[str, Callable[[], Controller]] = {
     "naive": NaiveController,
     "webster": WebsterController,
     "actuated": ActuatedController,
     "max_pressure": MaxPressureController,
     "rl": _rl_factory,
+    "rl_pattern": _rl_pattern_factory,
 }
 
 __all__ = [
