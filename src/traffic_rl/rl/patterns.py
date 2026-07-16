@@ -1,7 +1,7 @@
 """Traffic-pattern tracking: what the policy knows that a gap detector cannot.
 
 A vehicle-actuated controller sees the last ~3 seconds. PatternTracker gives
-the learned policy exponential moving estimates of the per-approach arrival
+the learned policy exponential moving estimates of the per-lane-group arrival
 RATE at two time constants — a fast one (~1 min, "what is happening right
 now") and a slow one (~15 min, "what kind of hour is this") — computed purely
 from the same detector pulses (obs.arrivals_last_step) real hardware has.
@@ -12,13 +12,13 @@ from __future__ import annotations
 
 import numpy as np
 
-from traffic_rl.config import N_APPROACHES
+from traffic_rl.config import N_MOVEMENTS
 from traffic_rl.controllers.base import Observation
 from traffic_rl.rl.features import N_FEATURES, featurize
 
 FAST_TAU = 60.0  # seconds
 SLOW_TAU = 900.0
-N_PATTERN_FEATURES = 2 * N_APPROACHES
+N_PATTERN_FEATURES = 2 * N_MOVEMENTS
 N_FEATURES_PATTERN = N_FEATURES + N_PATTERN_FEATURES
 _RATE_NORM = 7.0  # log1p(1000 veh/h) ≈ 6.9
 
@@ -29,8 +29,8 @@ class PatternTracker:
         self.reset()
 
     def reset(self) -> None:
-        self.fast = np.zeros(N_APPROACHES)
-        self.slow = np.zeros(N_APPROACHES)
+        self.fast = np.zeros(N_MOVEMENTS)
+        self.slow = np.zeros(N_MOVEMENTS)
 
     def update(self, obs: Observation) -> None:
         rate_now = obs.arrivals_last_step / self.dt * 3600.0  # veh/h, instantaneous

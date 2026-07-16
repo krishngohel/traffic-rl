@@ -15,9 +15,11 @@ from traffic_rl.sim.core import IntersectionSim
 def obs_with_arrivals(counts):
     from traffic_rl.controllers.base import Observation
 
+    arrivals = np.zeros(8)
+    arrivals[: len(counts)] = counts
     return Observation(
-        t=0.0, queue_lengths=np.zeros(4), oldest_wait=np.zeros(4),
-        time_since_arrival=np.zeros(4), arrivals_last_step=np.array(counts, dtype=float),
+        t=0.0, queue_lengths=np.zeros(8), oldest_wait=np.zeros(8),
+        time_since_arrival=np.zeros(8), arrivals_last_step=arrivals,
         phase_onehot=np.array([1.0, 0.0]), signal_state_onehot=np.array([1.0, 0, 0]),
         phase_elapsed=0.0, ped_call=np.zeros(2), action_mask=np.array([True, True]),
     )
@@ -49,13 +51,13 @@ def test_pattern_features_shape_and_range():
         obs = sim.step(0).obs
     assert f.shape == (N_FEATURES_PATTERN,)
     assert np.isfinite(f).all()
-    assert (f[-8:] >= 0).all() and (f[-8:] <= 1.5).all()
+    assert (f[-16:] >= 0).all() and (f[-16:] <= 1.5).all()
 
 
 def test_pattern_controller_deterministic_and_masked(tmp_path):
     from traffic_rl.rl.pattern_policy import PatternRLController
 
-    net = MLP((N_FEATURES_PATTERN, 96, 96, 2), np.random.default_rng(8))
+    net = MLP((N_FEATURES_PATTERN, 96, 96, 4), np.random.default_rng(8))
     path = tmp_path / "w.npz"
     net.save(path)
     a = PatternRLController(weights=path)
@@ -79,4 +81,4 @@ def test_pattern_training_smoke(tmp_path):
     train_pattern_policy(steps=6000, seed=1, out=out)
     assert out.exists()
     loaded = MLP.load(out)
-    assert loaded.forward(np.zeros(N_FEATURES_PATTERN)).shape == (1, 2)
+    assert loaded.forward(np.zeros(N_FEATURES_PATTERN)).shape == (1, 4)

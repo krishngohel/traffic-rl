@@ -3,305 +3,279 @@
 **Can smarter traffic-light timing cut how long we all wait?**
 
 We have all sat at a red light on an empty road while the busy direction backs
-up. This project tests whether better signal control actually fixes that —
-starting with an honest simulator and the four classic strategies traffic
-engineers already use, so anything built later has real opponents to beat.
+up. This project tests whether better signal control actually fixes that — an
+honest simulator, the classic strategies traffic engineers already use as real
+opponents, and a retiming tool that turns the count data cities already
+collect into implementable timing sheets.
 
-**The current verdict, up front: machine learning now holds the crown — but it
-took three honest attempts to get there.** The first RL agent lost to a 1960s
-actuated controller and that negative result was published, not buried (Phase
-2, below). At corridor scale the gap narrowed to a tie (Phase 3). The
-breakthrough was **pattern awareness** (Phase 4): giving the policy learned
-estimates of the demand pattern itself — the thing no gap detector can see —
-and training it on time-varying traffic so anticipation pays. The
-pattern-aware policy now **beats the champion actuated controller with
-statistical significance on two of three scenarios and ties it on the third,
-never losing, while serving pedestrians better on two of three.**
+**The current verdict, up front.** Phase 5 made the model realistic — turning
+movements, protected/permissive lefts, multi-lane approaches, ITE/MUTCD
+clearance intervals from site geometry — and realism redrew the scoreboard
+honestly:
 
-**This is also a practical tool**: point `traffic-rl-optimize` at a CSV of real
-intersection counts and it returns optimized time-of-day signal plans — and,
-with `--train-site`, a site-tuned ML policy — with simulated, CI-backed
-projections of the wait-time reduction. See "Optimize a real intersection"
-below.
+- **At single intersections, the 1960s actuated controller took its crown
+  back.** It wins all five scenarios; the learned policy sits 1–3 s behind on
+  four of them and loses badly at the protected-left arterial (details below,
+  published rather than buried).
+- **At corridor scale, the learned policy keeps a real win**: it beats
+  actuated on the rush-hour corridor by 10.0 s journey p95 (paired 95% CI
+  [+4.6, +15.5]) and beats the coordinated green wave everywhere.
+- **The most valuable Phase 5 find was a safety bug**: with more than two
+  phases, the old anti-starvation backstop could be sidestepped by a
+  controller that never requested the left-turn phase. The state machine now
+  guarantees any waiting call is served within `max_call_wait` (200 s), no
+  matter how adversarial the controller — safety by construction, extended.
 
-## Phase 1 results
+**This is also a practical tool**: point `traffic-rl-optimize` at a CSV of
+real intersection counts — including standard turning-movement counts — and
+it returns a screening-level retiming study: left-turn protection warrants,
+phase plans, geometry-derived clearance intervals, time-of-day green splits,
+and CI-backed projections of the wait-time reduction.
 
-Headline metric: **p95 wait** — the unluckiest 1 in 20 drivers. Average wait
-lies; it hides a light quietly leaving one road to rot. Every number below is
-the mean of **20 independent seeded runs** with a t-based 95% CI, and every
-controller sees the *same* 20 demand realizations (paired seeds).
+## Optimize a real intersection from count data
+
+Feed the tool a standard count study. Legacy per-approach totals still work;
+full turning-movement counts (TMC) unlock the Phase 5 realism:
+
+```csv
+time,north_left,north_thru,north_right,south_left,...,west_right,ped_ns,ped_ew
+07:00,215,610,60,95,340,45,...,25,18,14
+```
+
+```powershell
+traffic-rl-optimize counts.csv --site site.json
+# benchmark against your intersection's current plan:
+traffic-rl-optimize counts.csv --site site.json --current-greens 15 30 28
+```
+
+`site.json` carries the geometry the ITE/MUTCD formulas need (approach speeds,
+street widths, lanes, left-turn bays); without it, conservative defaults are
+used and the report says so. The study you get back:
+
+- **Left-turn protection warrant** per approach — volume (≥ 240 veh/h) and
+  opposing cross-product (≥ 50k/100k) screening, with the triggering interval
+  and numbers cited in the report.
+- **Phase plan** in canonical order (protected lefts leading), with
+  **clearance intervals from geometry**: ITE kinematic yellow from approach
+  speed, all-red from crossing width, MUTCD pedestrian walk + flashing
+  don't-walk from crosswalk length.
+- **Time-of-day plans**: per-interval Webster + paired-seed local search, then
+  a **full-profile tournament** — interval-by-interval optimization alone
+  misses peak-hour queue carryover (measured on the bundled arterial, where
+  it recommended plans that lost to equal splits until the tournament stage
+  caught it).
+- **CI-backed comparison** against naive, Webster-on-average-flows, actuated,
+  max-pressure, and the learned policy — because "what would detection
+  hardware buy instead?" is the question a screening study should answer.
+
+On the bundled legacy example (`examples/counts_example.csv`, a 5-hour AM
+profile) the recommended plans cut p95 wait **57%** vs a naive 50/50 signal
+(43.4 s vs 101.5 s); actuated reaches 34.1 s and the learned policy 36.5 s —
+on a demand profile neither ever saw.
+
+**Sample lights**: `examples/sites/` bundles two ready-to-run intersections
+with full TMC profiles and geometry — a 45 mph suburban arterial whose NS
+lefts trip the protection warrant (4.3 s yellows, 3-phase plan), and a 25 mph
+downtown corner with shared-lane lefts and lunch-peak pedestrians. Both are
+representative sites, not surveys; see `examples/sites/README.md`.
+
+**Whole corridors too:** add a `node` column and the same command retimes the
+arterial — coordinated time-of-day plans with a common cycle, per-node
+Webster splits, and progression offsets chosen by simulation. On the bundled
+3-intersection example it picks the westbound wave for the AM rush and cuts
+journey p95 from an unstable **≥ 764 s** under uncoordinated naive timing to
+**72 s** (actuated 61 s, shared RL 66 s alongside). The corridor model stays
+through-only — a stated limit.
+
+## Phase 5 results: the realistic model
+
+Headline metric: **p95 wait** — the unluckiest 1 in 20 drivers. Every number
+is the mean of **20 paired-seed runs** with a t-based 95% CI; every controller
+sees the same 20 demand realizations.
+
+| p95 wait (s) | symmetric | asymmetric | heavy | arterial_lefts | downtown_shared |
+|---|---|---|---|---|---|
+| Naive equal-split | 45.8 | **≥ 162.4** | 80.5 | 68.0 | 39.9 |
+| Webster (1958) | 50.3 | 62.0 | 68.3 | ≥ 137.1 (unstable) | 51.5 |
+| **Actuated** | **37.6** | **36.0** | **51.0** | **54.1** | **34.5** |
+| Max-pressure | 43.9 | 37.1 | 69.0 | 94.3 | 36.9 |
+| RL (DQN) | 40.4 | 37.3 | 53.9 | 202.8 | 37.5 |
+
+`arterial_lefts` is the new flagship: a 45 mph 2-lane arterial with warranted
+protected lefts and geometry-derived timings. `downtown_shared` is a narrow
+downtown corner where lefts share the lane and pedestrians dominate. Paired
+differences (actuated − RL): −2.8 [−3.6, −2.1] symmetric, −1.3 [−2.4, −0.2]
+asymmetric, −2.9 [−4.1, −1.7] heavy, −3.0 [−3.9, −2.1] downtown — actuated's
+wins are small but statistically real. On the arterial it is −149 s: not
+close, and the honest headline of this phase.
 
 ![p95 wait by controller and scenario](docs/charts/p95_bar.png)
 
-| p95 wait (s) | symmetric | asymmetric | heavy |
+Two findings worth the price of admission:
+
+1. **Webster goes unstable at the protected-left arterial** — a fixed plan
+   built from average flows cannot buy the left phase enough green at the
+   peak without starving it off-peak. This is why real arterials get
+   detection hardware, and the model now reproduces it.
+2. **The learned policy's arterial failure is a credit-assignment story, not
+   a mystery.** The policy defers the left phase (immediate clearance cost,
+   slowly-accruing starvation penalty) — and during exploration it starved
+   left bays outright, which is how the safety gap below was found. Attempted
+   fixes are documented under "The RL story".
+
+## Corridor results (through-only model, 20 paired seeds)
+
+| journey p95 (s) | corridor | corridor_rush | corridor_cross |
 |---|---|---|---|
-| Naive 50/50 | 44.7 | **153.2** (CI 127–179, wildly unstable) | 78.0 |
-| Webster (1958) | 50.0 | 62.1 | 65.6 |
-| Actuated | **37.8** | **35.5** | **50.8** |
-| Max-pressure | 42.5 | 36.9 | 68.8 |
+| Naive 50/50 (uncoordinated) | ≥ 273 | ≥ 1213 (all runs unstable) | 157 |
+| Green wave (coordinated Webster + offsets) | 80.3 | 117.7 | 100.7 |
+| Max-pressure (downstream-aware) | 127.2 | 256.8 | 123.6 |
+| Actuated (independent) | **70.5** | 88.4 | **74.0** |
+| **RL (shared policy)** | 73.6 | **78.4** | 76.9 |
 
-On the asymmetric scenario (a busy road crossing a quiet one — the case that
-motivated the project), demand-blind 50/50 timing leaves the unlucky driver
-waiting **2.5 minutes and swings wildly run to run**, while a 1958 formula cuts
-that 2.5x and the two adaptive controllers cut it **4.3x**. Paired per-seed
-differences vs naive (the statistically honest comparison): Webster −91 s
-[64, 118], actuated −118 s [92, 144], max-pressure −116 s [90, 142] — all
-decisive.
+![Network p95](docs/charts/network/p95_bar.png)
 
-Two honest wrinkles the charts surface rather than hide:
+One set of weights runs all four intersections, seeing only local state plus
+two downstream queues. Paired vs actuated: **+10.0 s [+4.6, +15.5] on
+corridor_rush** — a statistically decisive win exactly where coordination is
+hardest — and −3.0 / −2.9 s on the other two. The green wave and network
+max-pressure lose to it everywhere.
 
-- **On symmetric demand, naive is fine.** A 50/50 split is the *right* answer
-  when demand is symmetric; Webster lands in the same place. The naive
-  controller's failure mode is specifically demand asymmetry.
-- **Webster pays pedestrians for its vehicle gains.** The pedestrian service
-  floor (20 s walk + clearance) forces Webster onto a long cycle on asymmetric
-  demand, and its minor-road pedestrians wait for it (ped p95 85 s vs ~45–51 s
-  for everyone else — see `docs/charts/ped_wait_bar.png`).
+## The RL story, honestly
 
-![Queue growth](docs/charts/queue_timeseries.png)
+Phase 4's pattern-aware policy beat actuated on the through-only model. **That
+crown did not survive the realistic model.** What happened, in order:
+
+- The realism upgrade moved the RL interface to canonical phase slots
+  (NS-left / NS-through / EW-left / EW-through), so one set of weights runs
+  any layout; observations grew to 8 lane groups plus lane counts.
+- Retrained policies kept their strength at conventional intersections but
+  repeatedly failed the protected-left arterial. Documented negative results
+  along the way: a squared-queue fairness reward destabilized training
+  outright; fully randomized geometry and 3-lane-config menus diluted the
+  small net; per-lane demand scaling created unwinnable episodes that
+  poisoned replay (a specialist trained *only* on arterial episodes scored
+  p95 2400 s — the smoking gun; fixed by rescaling every training episode to
+  a Webster flow ratio in [0.45, 0.92]).
+- Exploration-phase starvation exposed the **backstop gap**: the old
+  guarantee (force a switch after 120 s of continuous green) cannot protect a
+  third phase from a controller that keeps bouncing between the other two.
+  The machine now also force-serves any call waiting past 200 s
+  (`max_call_wait`), tested with an adversarial through-only controller.
+- The pattern-aware recipe (demand-rate features, n-step returns) is
+  **under revision on the new model**: its retraining runs either regressed
+  at conventional sites or failed the arterial, and the final attempt was cut
+  off after exceeding its training budget 2x. No pattern weights ship in
+  v0.6.0; `traffic-rl-train --pattern` reproduces the recipe for anyone who
+  wants the fight.
+
+The shipped `rl` policy (pure NumPy double-DQN, 96-wide, 2.5M steps, trained
+across randomized layouts, lane configs, turning fractions, and demand):
+within 1.3–3 s of actuated everywhere except the arterial, and the corridor
+win above. The thesis after realism: **learning wins where coordination is
+the problem; tuned local adaptation still wins where phase discipline is.**
 
 ## Why trust these numbers
 
 - **Per-run p95, aggregated across runs.** Waits within a run are autocorrelated,
   so a pooled percentile has no valid confidence interval. Each run contributes
-  one p95; the 20 runs get a t-CI. The pooled distribution is only used for the
-  (clearly labeled) ECDF chart.
+  one p95; the 20 runs get a t-CI.
 - **Paired seeds (common random numbers).** Run *k* uses the same seed for every
   controller, and superiority claims cite the CI on the paired per-seed
   differences, not overlapping marginal bars.
 - **Censoring is surfaced, not hidden.** Vehicles still queued at the horizon
   count with a lower-bound wait; if more than 5% of a run is censored its p95 is
-  reported as "≥" and the run is flagged unstable. Dropping them would flatter
-  exactly the worst controllers.
-- **Identical rules for everyone.** One warm-up (1200 s), one measured hour, one
-  signal-safety state machine (min green, yellow, all-red, ped locks, 120 s
-  anti-starvation backstop) shared by all controllers.
-- **Safety is enforced by the simulator, not trusted to controllers.** An
-  adversarial controller that requests a random phase every second is part of
-  the test suite; the state machine makes it safe by construction. The same
-  guarantee will hold for the RL agent.
-- **Fairness of baseline parameters.** Actuated uses textbook defaults (min
-  green 8 s, max 45 s, 3.0 s gap). Max-pressure uses a 15 s control period,
-  chosen from a documented sweep ({5, 10, 15, 20} s: heavy-scenario p95 falls
-  83→62 s as the period grows while asymmetric stays ~36 s — max-pressure is
-  blind to switching cost, and 5 s decisions thrash near saturation).
+  reported as "≥" and the run is flagged unstable.
+- **Identical rules for everyone.** One warm-up, one measured window, one
+  signal-safety state machine (per-phase min green, ITE yellow + all-red, ped
+  walk locks, green-duration backstop, and the 200 s call-wait guarantee)
+  shared by all controllers.
+- **Safety is enforced by the simulator, not trusted to controllers.** The
+  test suite drives the machine with an adversarial random controller and a
+  left-phase-starving controller; both are made safe by construction. Yellow
+  and all-red hold per phase even with geometry-derived (non-uniform)
+  intervals.
+- **Fairness of baseline parameters.** Actuated uses textbook defaults, plus
+  phase skipping and shorter left-phase timers at protected-left sites —
+  the real capability detection hardware buys. Max-pressure's 15 s period
+  comes from a documented sweep. When the learned policy lost, it got serious
+  retries (documented above), just as the classics got their sweeps.
 
 ## The model (and its limits)
 
-Single 4-way intersection, two phases (NS / EW), one lane group per approach,
-no protected left turns. **Point-queue model**: Poisson arrivals per approach
-(independent RNG streams), saturation-flow discharge (1800 veh/h/lane) with 2 s
-startup lost time, no discharge during yellow/all-red. Pedestrians arrive
-Poisson per crossing, place a call, and are served concurrently with the
-parallel vehicle phase (7 s walk + 13 s clearance, never truncated).
+Single 4-way intersection. **8 lane groups**: through+right and left-turn per
+approach. Left-turn treatments per approach: shared lane (permissive friction
+multiplier), permissive bay (gap-acceptance capacity against opposing flow,
+with 2 sneakers per phase end), or protected bay (own phase). Phase table in
+canonical order, up to 4 phases. Point-queue dynamics: Poisson arrivals per
+lane group (independent RNG streams), saturation-flow discharge
+(1800 veh/h/lane) with 2 s startup lost time. Pedestrians place calls and are
+served with the parallel through phase (7 s walk + clearance from crossing
+distance, never truncated). Clearance intervals per phase from ITE formulas
+over site geometry when provided.
 
-Deliberate simplifications, stated up front: no car-following dynamics, no
-spillback or link lengths (irrelevant with one intersection), no left turns,
-1 s timestep. These change absolute waits but not controller *rankings*, which
-is what Phase 1 is for. Max-pressure at a single isolated intersection honestly
-degenerates to weighted longest-queue-first — it is included because it is the
-standard classical baseline in the RL traffic literature.
+Deliberate simplifications, stated up front: no RTOR, no protected+permissive
+(FYA) phasing, no lagging lefts, left-bay storage is not capacity-limited, no
+car-following dynamics or spillback, 1 s timestep. The corridor model remains
+through-only. These change absolute waits, not the honesty of the
+comparisons; treat optimizer projections as a screening study, not a
+signed-off timing sheet.
 
-The simulator runs **~40,000x real time** (a full sim-hour in well under a
-second of wall clock; the entire 12-experiment, 240-run evaluation takes about
-a minute).
+The simulator still runs ~40,000x real time; the full 25-experiment, 500-run
+evaluation takes a few minutes.
 
-## Optimize a real intersection from count data
+## History: Phases 1–4 (through-only model)
 
-Feed the tool a standard intersection count study — per-approach volumes per
-interval, the data cities already collect:
+The arc so far, all numbers on the pre-realism 2-phase model (see tagged
+releases v0.1.0–v0.5.0 for the full write-ups):
 
-```csv
-time,north_veh,south_veh,east_veh,west_veh,ped_ns,ped_ew
-07:00,560,540,180,170,35,30
-08:00,640,610,210,190,45,40
-09:00,420,400,180,170,30,25
-```
-
-```powershell
-traffic-rl-optimize counts.csv --runs 10
-# benchmark against your intersection's current plan:
-traffic-rl-optimize counts.csv --current-greens 25 25
-```
-
-It computes a Webster plan per interval, refines each with a paired-seed local
-search over cycle and split, assembles time-of-day plans, and evaluates them
-against baselines on the full demand profile. Output: `report.md` /
-`report.json` (the recommended plans plus a CI-backed comparison) and
-`comparison.png`. On the bundled example (`examples/counts_example.csv`, a
-5-hour AM-peak profile) the recommended plans cut p95 wait **58%** vs a naive
-50/50 signal (42.7 s vs 102.8 s); the report also shows what detection
-hardware would buy (actuated: 34.3 s). Projections inherit the model's stated
-limits — point-queue, no turning movements — so treat them as a screening
-study, not a signed-off timing sheet.
-
-**Train the ML on your site's patterns:** `--train-site` fine-tunes the
-pattern-aware policy on demand sampled around your data (random windows of
-your day, scaled and jittered), starting from the shipped general weights, and
-adds it to the comparison as `rl_site_trained`. On the bundled example the
-general pattern policy already ties actuated (34.6 vs 34.3 s), so site tuning
-mainly matters for demand outside the general training range.
-
-**Whole corridors too:** add a `node` column (0 = west-most signal, increasing
-eastward) with counts for every intersection, and the same command retimes the
-arterial — coordinated time-of-day plans with a common cycle, per-node Webster
-splits, and progression offsets chosen by simulation (eastbound wave, westbound
-wave, or simultaneous, per interval):
-
-```powershell
-traffic-rl-optimize corridor_counts.csv --link-travel 20
-```
-
-On the bundled 3-intersection example (`examples/corridor_counts_example.csv`,
-a westbound AM rush) it correctly picks a **westbound** progression for the
-peak interval and cuts journey p95 (the sum of a vehicle's waits along the
-whole corridor) from an unstable **≥ 790 s** under uncoordinated naive timing
-to **74 s** — with the adaptive references (actuated 61 s, shared RL 62 s)
-reported alongside.
-
-## Phase 4: pattern-aware ML — the first controller to beat the classics
-
-The insight, extracted from two rounds of losing: every controller in this
-project — including the first DQN — decided from a snapshot. Queue lengths
-now, gaps now. But traffic has *patterns*: rushes build, quiet hours drain,
-and knowing which regime you are in changes the right decision. Real actuated
-hardware cannot see this; a learned controller can.
-
-The pattern-aware recipe (`traffic-rl-train --pattern`):
-
-- **Pattern features**: exponential moving estimates of each approach's
-  arrival RATE at two time constants (~1 min and ~15 min), computed from the
-  same detector pulses real hardware has (`rl/patterns.py`). The policy sees
-  "what is happening" *and* "what kind of hour this is".
-- **Training where anticipation pays**: half the episodes have piecewise
-  time-varying demand (three regimes per episode), so exploiting the pattern
-  features is rewarded during learning.
-- **A stronger learner**: n-step returns (n=5), a wider net (96), 3M steps —
-  still pure NumPy, still fully seeded, trained in ~7 minutes on a laptop.
-
-Result, 20 paired seeds, the same harness that judged everything else:
-
-| p95 wait (s) | symmetric | asymmetric | heavy |
-|---|---|---|---|
-| Actuated (previous champion) | 37.8 | 35.5 | 50.8 |
-| **RL pattern-aware** | **35.4** | **35.2** | **48.2** |
-| Paired Δ (act − RL), 95% CI | **+2.4 [+1.7, +3.1]** | +0.3 [−0.3, +0.8] | **+2.7 [+2.0, +3.3]** |
-
-Two significant wins, one statistical tie, zero losses — with mean waits also
-lower everywhere and pedestrian p95 better on symmetric (43 vs 47 s) and heavy
-(62 vs 70 s), slightly worse on asymmetric (51 vs 49 s). On the real-data
-example profile it ties actuated (34.6 vs 34.3 s) — without ever seeing that
-data. This is the project's thesis, finally earned: **learning the traffic
-pattern, not just reacting to it, is worth real seconds per person.**
-
-## Phase 3: four intersections — coordination changes the story
-
-A corridor of 4 signals on an EW arterial (link travel 20 s): eastbound and
-westbound traffic traverses every signal, cross streets enter locally, and a
-vehicle's wait is the **sum of its queue waits along the whole journey**.
-Through-traffic only, no spillback between nodes — stated limits.
-
-| journey p95 (s), 20 paired seeds | corridor | corridor_rush | corridor_cross |
-|---|---|---|---|
-| Naive 50/50 (uncoordinated) | ≥ 283 | ≥ 1221 (all runs unstable) | 165 |
-| Green wave (coordinated Webster + offsets) | 81 | 116 | 101 |
-| Max-pressure (downstream-aware) | 125 | 255 | 121 |
-| Actuated (independent) | **70** | 86 | **73** |
-| **RL (shared policy)** | 75 | **84** | 79 |
-
-![Network p95](docs/charts/network/p95_bar.png)
-
-Three honest findings:
-
-1. **Uncoordinated fixed time is catastrophic at network scale** — queues
-   compound across signals until the corridor is fully unstable at rush.
-2. **The shared RL policy beats every coordination method.** One set of
-   weights runs all four intersections, seeing only local state plus the two
-   downstream arterial queues. It beats the green wave and network
-   max-pressure on all three corridors, and vs actuated the gap narrows from
-   ~30% at one intersection to ~7%: −4.6 s [−6.2, −3.0] on `corridor`,
-   −6.1 s [−7.8, −4.3] on `corridor_cross` (where it serves pedestrians
-   *better*), and a statistical tie on `corridor_rush` (+1.5 s [−1.2, +4.1]).
-3. **Actuated still holds the crown.** Local adaptation with three tuned
-   parameters remains unbeaten overall. Max-pressure's poor showing comes with
-   a caveat: its optimality theory is about spillback-constrained networks,
-   which this model deliberately omits.
-
-Train the corridor policy yourself: `python -m traffic_rl.rl.train_network`.
-Evaluate: `traffic-rl-eval-network`.
+- **Phase 1** (v0.1.0): simulator + four classic baselines under the honesty
+  rules. On asymmetric demand, naive 50/50 leaves the unlucky driver waiting
+  2.5 minutes; actuated cuts it 4.3x.
+- **Phase 2** (v0.2.0): first DQN — an honest negative result. Beat naive and
+  Webster, lost to actuated by ~10 s on two of three scenarios.
+- **Phase 3** (v0.3.0–v0.4.0): corridor network + the real-data optimizer
+  tool; shared RL beat every coordination method, actuated stayed champion.
+- **Phase 4** (v0.5.0): pattern-aware policy (demand-rate features, n-step
+  returns) beat actuated with statistical significance on two of three
+  scenarios, never losing — the first ML win. Phase 5's realistic model has
+  since raised the bar; that fight is being re-fought above.
 
 ## Quickstart
 
 ```powershell
 pip install -e .[dev]          # numpy core + charts + viewer + tests
-pytest                         # 35 tests incl. safety invariants + 800x perf gate
-traffic-rl-eval --runs 20      # full 4-controller x 3-scenario evaluation
+pytest                         # 86 tests incl. safety invariants + perf gate
+traffic-rl-eval --runs 20      # 5-controller x 5-scenario evaluation
 traffic-rl-charts              # renders results/charts/*.png
-traffic-rl-watch --controller actuated --scenario asymmetric --speed 8
+traffic-rl-optimize examples\sites\suburban_arterial\counts.csv --site examples\sites\suburban_arterial\site.json
+traffic-rl-watch --controller actuated --scenario arterial_lefts --speed 8
 ```
 
 The viewer (`pygame-ce`) shows live queues, signal heads, and pedestrian walk
 phases at 1x–1024x. Keys: `Space` pause · `+`/`-` speed · `R` new seed · `Esc`
 quit.
 
-## Phase 2: the RL agent — an honest negative result
-
-A double-DQN (pure NumPy: 22→64→64→2, replay, target network, action masking —
-no GPU, no framework, fully seeded) was trained for 1.5M steps on **randomized
-demand** (per-approach 100–650 veh/h, peds 20–90/h): one policy, no
-per-scenario tuning, reward = −(vehicle + pedestrian) waiting per second, so it
-cannot win by starving crosswalks. Evaluated by the identical harness, seeds,
-and metrics as the classics.
-
-| p95 wait (s), paired vs actuated | symmetric | asymmetric | heavy |
-|---|---|---|---|
-| Actuated (best classic) | **37.8** | **35.5** | 50.8 |
-| RL (DQN) | 48.2 | 46.8 | **49.3** |
-| Paired Δ (act − RL), 95% CI | −10.4 [−11.3, −9.4] | −11.3 [−12.4, −10.3] | **+1.5 [+0.3, +2.7]** |
-
-**The verdict:** the RL agent beats naive everywhere and Webster on the hard
-scenarios, but a 1960s-era vehicle-actuated controller with three parameters
-beats it decisively on two of three scenarios, and it costs pedestrians more
-(ped p95 63–74 s vs actuated's 47–49 s) except on heavy. Its one statistically
-significant win is the near-saturation scenario (+1.5 s p95 over actuated,
-with better ped waits there too) — plausibly because saturation is where
-myopic gap-out logic wastes capacity and value estimation helps.
-
-Fairness both ways: the classics got a parameter sweep, so the agent got a
-serious retry (3M steps, 128-wide net, γ=0.995, slower exploration decay) — it
-came out *worse* on asymmetric (68.7 s). The shipped weights are the better
-first run. Things not yet tried that might flip this: longer training with
-prioritized replay, a recurrent policy, reward shaping on p95 rather than mean
-wait, or multi-intersection settings (where max-pressure's theory shines and
-hand-tuned controllers coordinate poorly — likely the more interesting fight).
-
-Train your own: `traffic-rl-train` (~3 minutes on a laptop, deterministic per
-seed). The optional Gymnasium wrapper (`pip install traffic-rl[rl]`,
-`traffic_rl.rl.env.TrafficEnv`) exists so you can point stable-baselines3 or
-any Gym-compatible library at the same sim.
-
-### The RL interface
-
-The sim core *is* the environment: `reset(seed) -> Observation`,
-`step(action) -> StepResult`. `Observation` is fixed-size numeric arrays (flattens
-straight into a Gymnasium `Box`), `StepResult.info` carries per-step reward
-ingredients (`wait_accrued_this_step`, `ped_wait_accrued_this_step`,
-`departures_this_step`, `total_queue`), and `action_mask` exposes which phases
-are legal. The Gymnasium wrapper needed zero changes to the core — and the
-signal state machine means a half-trained policy still cannot run a yellow,
-truncate a walk phase, or starve an approach past the backstop.
+Train your own policies: `traffic-rl-train` (standard DQN, minutes on a
+laptop, deterministic per seed), `traffic-rl-train --pattern` (the pattern
+recipe), `python -m traffic_rl.rl.train_network` (corridor policy). The
+Gymnasium wrapper (`pip install traffic-rl[rl]`, `traffic_rl.rl.env.TrafficEnv`)
+exposes the same sim to stable-baselines3 or any Gym-compatible library, with
+actions in canonical phase slots.
 
 ## Layout
 
 ```
 src/traffic_rl/
-├── sim/          # IntersectionSim, SignalStateMachine, queues, arrivals, NetworkSim
-├── controllers/  # naive, Webster, actuated, max-pressure, rl; network: green wave, ...
-├── rl/           # NumPy double-DQN, trainers, trained weights, Gymnasium wrapper
+├── sim/          # IntersectionSim (8 lane groups), SignalStateMachine, NetworkSim
+├── controllers/  # naive, Webster, actuated (w/ phase skipping), max-pressure, rl
+├── rl/           # NumPy double-DQN, slot-space features, trainers, Gymnasium wrapper
 ├── eval/         # metrics (the honesty rules), harnesses, charts
 ├── viewer/       # live 3D pygame viewer
-├── data.py       # real traffic-count CSV -> demand schedule
-└── optimize.py   # traffic-rl-optimize: signal retiming from real counts
+├── config.py     # layouts, phase tables, ITE/MUTCD timing formulas
+├── data.py       # count CSVs (incl. TMC) + site geometry + left-turn warrant
+└── optimize.py   # traffic-rl-optimize: retiming studies from real counts
 ```
 
-MIT license. Built as the Phase 1 floor for an open RL-for-traffic experiment.
+MIT license. Built as an open experiment in honest RL-for-traffic; Phase 5
+made it a screening tool a practitioner can argue with.

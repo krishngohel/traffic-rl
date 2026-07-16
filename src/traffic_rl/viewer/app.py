@@ -24,7 +24,7 @@ except ImportError as e:  # pragma: no cover
         "The viewer needs pygame-ce. Install it with: pip install traffic-rl[viewer]"
     ) from e
 
-from traffic_rl.config import PHASE_APPROACHES
+from traffic_rl.config import left_group, through_group
 from traffic_rl.controllers import CONTROLLER_REGISTRY
 from traffic_rl.scenarios import SCENARIOS, make_config
 from traffic_rl.sim.core import IntersectionSim
@@ -309,7 +309,9 @@ class ViewerApp:
 
     def _signal_color(self, a: int) -> tuple[int, int, int]:
         sig = self.sim.signal
-        if a not in PHASE_APPROACHES[sig.phase]:
+        # The per-approach head tracks the THROUGH movement; a protected-left
+        # phase shows red here (the left arrow head is not rendered).
+        if through_group(a) not in sig.current.movements:
             return RED
         if sig.state == SignalState.GREEN:
             return GREEN_ON
@@ -366,12 +368,16 @@ class ViewerApp:
 
     def _draw_hud(self, screen, font) -> None:
         sig = self.sim.signal
-        q = [len(qu) for qu in self.sim.queues]
+        # Per-approach totals: through group + left bay.
+        q = [
+            len(self.sim.queues[through_group(a)]) + len(self.sim.queues[left_group(a)])
+            for a in range(4)
+        ]
         lines = [
             f"{self.controller_name}  ·  {self.scenario}  ·  seed {self.seed}",
             f"t = {self.sim.t:7.0f} s   speed {self.speed:.0f}x"
             + ("   PAUSED" if self.paused else ""),
-            f"phase {'NS' if sig.phase == 0 else 'EW'} {sig.state.name}"
+            f"phase {sig.current.name} {sig.state.name}"
             f"  ({sig.state_elapsed:.0f} s in state)",
             f"queues  N {q[0]:>3}  S {q[1]:>3}  E {q[2]:>3}  W {q[3]:>3}",
             f"mean wait so far: {self._mean_wait:5.1f} s   departed: {self._n_departed_done()}",

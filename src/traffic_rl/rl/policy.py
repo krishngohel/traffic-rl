@@ -13,7 +13,7 @@ import numpy as np
 from traffic_rl.config import SimConfig
 from traffic_rl.controllers.base import Controller, Observation
 from traffic_rl.rl.dqn import MLP
-from traffic_rl.rl.features import featurize
+from traffic_rl.rl.features import featurize, slot_action_mask, slot_to_phase
 
 DEFAULT_WEIGHTS = Path(__file__).parent / "weights.npz"
 
@@ -34,5 +34,5 @@ class RLController(Controller):
 
     def act(self, obs: Observation) -> int:
         q = self.net.forward(featurize(obs))[0]
-        q = np.where(obs.action_mask, q, -np.inf)
-        return int(np.argmax(q))
+        q = np.where(slot_action_mask(obs), q, -np.inf)
+        return slot_to_phase(obs, int(np.argmax(q)))

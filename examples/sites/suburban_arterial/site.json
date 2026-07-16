@@ -1,0 +1,9 @@
+{
+  "_comment": "Representative suburban arterial x collector. 4-lane 45 mph NS arterial with left-turn bays; 2-lane 30 mph EW collector with bays. Volumes and geometry are typical published values, not a surveyed site.",
+  "ns_speed_mph": 45,
+  "ew_speed_mph": 30,
+  "ns_street_width_m": 22.0,
+  "ew_street_width_m": 14.0,
+  "through_lanes": [2, 2, 1, 1],
+  "left_bays": [true, true, true, true]
+}

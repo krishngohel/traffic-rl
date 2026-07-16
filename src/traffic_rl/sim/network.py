@@ -227,7 +227,7 @@ class NetworkSim:
         return {
             "veh_arrival": entry,
             "veh_depart": depart,
-            "veh_approach": np.zeros(len(entry), dtype=np.int64),
+            "veh_group": np.zeros(len(entry), dtype=np.int64),
             "veh_wait_lower_bound": wait,  # exact for completed journeys
             "ped_arrival": ped_arrival,
             "ped_walk_start": ped_walk,

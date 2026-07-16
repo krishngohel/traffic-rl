@@ -48,7 +48,7 @@ def test_dqn_learns_a_bandit():
 def test_rl_controller_respects_mask_and_is_deterministic(tmp_path):
     from traffic_rl.rl.policy import RLController
 
-    net = MLP((N_FEATURES, 64, 64, 2), np.random.default_rng(5))
+    net = MLP((N_FEATURES, 64, 64, 4), np.random.default_rng(5))
     path = tmp_path / "w.npz"
     net.save(path)
     controller = RLController(weights=path)
@@ -71,7 +71,7 @@ def test_gymnasium_env_api():
     assert obs.shape == (N_FEATURES,) and "action_mask" in info
     total = 0.0
     for i in range(60):
-        obs, reward, terminated, truncated, info = env.step(i % 2)
+        obs, reward, terminated, truncated, info = env.step(1 if i % 2 else 3)
         total += reward
         assert not terminated
     assert truncated

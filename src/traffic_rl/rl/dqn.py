@@ -89,6 +89,7 @@ class Adam:
 class Replay:
     capacity: int
     n_features: int
+    n_actions: int = 2
     _n: int = 0
     _i: int = 0
     s: np.ndarray = field(init=False)
@@ -103,7 +104,7 @@ class Replay:
         self.a = np.zeros(self.capacity, dtype=np.int64)
         self.r = np.zeros(self.capacity, dtype=np.float32)
         self.s2 = np.zeros((self.capacity, self.n_features), dtype=np.float32)
-        self.mask2 = np.zeros((self.capacity, 2), dtype=bool)
+        self.mask2 = np.zeros((self.capacity, self.n_actions), dtype=bool)
         self.done = np.zeros(self.capacity, dtype=bool)
 
     def add(self, s, a, r, s2, mask2, done) -> None:

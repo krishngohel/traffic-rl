@@ -1,8 +1,13 @@
 """IntersectionSim — the single source of truth for dynamics and event logging.
 
 API shape is the Phase-2 RL contract: reset(seed) -> Observation,
-step(action) -> StepResult. The harness, the live viewer, and a future Gymnasium
+step(action) -> StepResult. The harness, the live viewer, and the Gymnasium
 wrapper all consume this same object.
+
+Phase 5: lane groups (through+right and left-turn per approach), protected and
+permissive left phases from the config's phase table, gap-acceptance service
+for permissive lefts (with sneakers at phase end), shared-lane left friction,
+and per-phase clearance intervals. See docs/DESIGN_PHASE5.md.
 """
 
 from __future__ import annotations
@@ -13,24 +18,29 @@ import numpy as np
 
 from traffic_rl.config import (
     N_APPROACHES,
+    N_MOVEMENTS,
     N_PED_MOVEMENTS,
-    N_PHASES,
-    PHASE_APPROACHES,
+    OPPOSING,
+    SNEAKERS_PER_PHASE,
     SimConfig,
+    left_group,
+    permissive_capacity,
+    through_group,
 )
 from traffic_rl.controllers.base import Observation, StepResult
 from traffic_rl.sim.arrivals import ArrivalStreams
-from traffic_rl.sim.queues import ApproachQueue
+from traffic_rl.sim.queues import MovementQueue
 from traffic_rl.sim.signal import SignalState, SignalStateMachine
 
 _GAP_CAP = 999.0  # reported cap for the time-since-arrival gap detector
+_OPP_RATE_TAU = 120.0  # EMA time constant for opposing-flow estimate (s)
 
 
 @dataclass
 class EventLog:
     veh_arrival: list[float] = field(default_factory=list)
     veh_depart: list[float] = field(default_factory=list)  # nan while queued
-    veh_approach: list[int] = field(default_factory=list)
+    veh_group: list[int] = field(default_factory=list)  # lane group 0..7
     ped_arrival: list[float] = field(default_factory=list)
     ped_walk_start: list[float] = field(default_factory=list)  # nan while waiting
     ped_movement: list[int] = field(default_factory=list)
@@ -43,7 +53,7 @@ class EventLog:
         return {
             "veh_arrival": np.asarray(self.veh_arrival),
             "veh_depart": np.asarray(self.veh_depart),
-            "veh_approach": np.asarray(self.veh_approach, dtype=np.int64),
+            "veh_group": np.asarray(self.veh_group, dtype=np.int64),
             "ped_arrival": np.asarray(self.ped_arrival),
             "ped_walk_start": np.asarray(self.ped_walk_start),
             "ped_movement": np.asarray(self.ped_movement, dtype=np.int64),
@@ -57,27 +67,39 @@ class EventLog:
 class IntersectionSim:
     def __init__(self, config: SimConfig):
         self.config = config
+        self.phases = config.phases
+        self.n_phases = len(self.phases)
+        self._phase_slots = np.array([p.slot for p in self.phases], dtype=np.int64)
+        self._group_lanes = np.array(
+            [config.group_lanes(g) for g in range(N_MOVEMENTS)], dtype=np.float64
+        )
         self._has_reset = False
 
     def reset(self, seed: int) -> Observation:
         cfg = self.config
         self.t = 0.0
-        self.streams = ArrivalStreams(seed, cfg.demand, cfg.dt, schedule=cfg.demand_schedule)
-        self.signal = SignalStateMachine(cfg.timing)
+        self.streams = ArrivalStreams(
+            seed, cfg.demand, cfg.dt, layout=cfg.layout, schedule=cfg.demand_schedule
+        )
+        self.signal = SignalStateMachine(cfg.timing, self.phases)
         self.queues = [
-            ApproachQueue(cfg.sat_flow, cfg.timing.startup_lost) for _ in range(N_APPROACHES)
+            MovementQueue(cfg.group_sat_flow(g), cfg.timing.startup_lost)
+            for g in range(N_MOVEMENTS)
         ]
         self.ped_call_pending = np.zeros(N_PED_MOVEMENTS, dtype=bool)
         self.waiting_peds: list[list[int]] = [[] for _ in range(N_PED_MOVEMENTS)]
         self.log = EventLog()
-        self._last_arrival_counts = np.zeros(N_APPROACHES, dtype=np.int64)
+        self._last_arrival_counts = np.zeros(N_MOVEMENTS, dtype=np.int64)
         self._pending_injections = [0] * N_APPROACHES
+        # EMA of each approach's through-group arrival rate (veh/s): the
+        # opposing-flow estimate the permissive-left gap model consumes.
+        self._through_rate_ema = np.zeros(N_APPROACHES)
         self._has_reset = True
         return self._observe()
 
     def inject_vehicles(self, approach: int, count: int) -> None:
         """Queue vehicles (e.g. arriving from an upstream intersection) to enter
-        the given approach during the next step's arrivals phase."""
+        the given approach's through group during the next step's arrivals."""
         self._pending_injections[approach] += count
 
     @property
@@ -86,6 +108,8 @@ class IntersectionSim:
 
     def action_mask(self) -> np.ndarray:
         return self.signal.legal_actions()
+
+    # ------------------------------------------------------------------ dynamics
 
     def step(self, action: int) -> StepResult:
         assert self._has_reset, "call reset(seed) first"
@@ -99,40 +123,60 @@ class IntersectionSim:
         # 2. Advance the signal. Conflicting-call flag (for the backstop) uses the
         #    state as the controller saw it.
         conflicting_call = self._conflicting_call(self.signal.phase)
-        events = self.signal.tick(dt, self.ped_call_pending, conflicting_call)
+        events = self.signal.tick(
+            dt, self.ped_call_pending, conflicting_call, self._phase_calls()
+        )
 
+        departures: list[tuple[int, int]] = []  # (veh_id, group)
+        if events.yellow_started is not None:
+            # Sneakers: lefts that were in the box waiting for a gap complete
+            # their turn as the permissive phase ends.
+            for g in self.phases[events.yellow_started].permissive_lefts:
+                for veh_id in self.queues[g].pop(SNEAKERS_PER_PHASE):
+                    departures.append((veh_id, g))
         if events.green_started is not None:
-            for a in PHASE_APPROACHES[events.green_started]:
-                self.queues[a].on_green_start()
+            started = self.phases[events.green_started]
+            for g in started.movements + started.permissive_lefts:
+                self.queues[g].on_green_start()
         if events.walk_started is not None:
             self._serve_walk(events.walk_started, t_new)
 
         # 3. Arrivals (rates may be time-varying under a demand schedule).
-        # Poisson draws happen for every approach (keeps streams aligned across
+        # Poisson draws happen for every lane group (keeps streams aligned across
         # configs), but masked approaches discard theirs and are fed by
-        # injection from upstream instead. Order per approach: external first,
+        # injection from upstream instead. Order per group: external first,
         # then injected — the network mirror relies on this FIFO order.
         veh_counts = self.streams.vehicle_counts(self.t)
-        arrivals = np.zeros(N_APPROACHES, dtype=np.int64)
-        for a in range(N_APPROACHES):
-            external = int(veh_counts[a]) if cfg.external_vehicle_arrivals[a] else 0
-            for _ in range(external + self._pending_injections[a]):
+        arrivals = np.zeros(N_MOVEMENTS, dtype=np.int64)
+        for g in range(N_MOVEMENTS):
+            approach = g % N_APPROACHES
+            external = int(veh_counts[g]) if cfg.external_vehicle_arrivals[approach] else 0
+            injected = 0
+            if g < N_APPROACHES:  # injections always enter the through group
+                injected = self._pending_injections[g]
+                self._pending_injections[g] = 0
+            for _ in range(external + injected):
                 veh_id = len(self.log.veh_arrival)
                 self.log.veh_arrival.append(t_new)
                 self.log.veh_depart.append(np.nan)
-                self.log.veh_approach.append(a)
-                self.queues[a].add(veh_id, t_new)
-            arrivals[a] = external + self._pending_injections[a]
-            self._pending_injections[a] = 0
+                self.log.veh_group.append(g)
+                self.queues[g].add(veh_id, t_new)
+            arrivals[g] = external + injected
         self._last_arrival_counts = arrivals
+        self._through_rate_ema += (dt / _OPP_RATE_TAU) * (
+            arrivals[:N_APPROACHES] / dt - self._through_rate_ema
+        )
 
         ped_counts = self.streams.ped_counts(self.t)
+        walk_movement = (
+            self.signal.walk_movement if self.signal.in_walk_window else None
+        )
         for m in range(N_PED_MOVEMENTS):
             for _ in range(int(ped_counts[m])):
                 ped_id = len(self.log.ped_arrival)
                 self.log.ped_arrival.append(t_new)
                 self.log.ped_movement.append(m)
-                if m == self.signal.phase and self.signal.in_walk_window:
+                if m == walk_movement:
                     self.log.ped_walk_start.append(t_new)  # crosses immediately
                 else:
                     self.log.ped_walk_start.append(np.nan)
@@ -140,14 +184,23 @@ class IntersectionSim:
                     self.ped_call_pending[m] = True
 
         # 4. Discharge on green.
-        departures = 0
-        departures_by_approach = np.zeros(N_APPROACHES, dtype=np.int64)
         if self.signal.state == SignalState.GREEN:
-            for a in PHASE_APPROACHES[self.signal.phase]:
-                for veh_id in self.queues[a].discharge(self.signal.state_elapsed, dt):
-                    self.log.veh_depart[veh_id] = t_new
-                    departures += 1
-                    departures_by_approach[a] += 1
+            phase = self.phases[self.signal.phase]
+            elapsed = self.signal.state_elapsed
+            for g in phase.movements:
+                mult = self._shared_left_multiplier(g)
+                service = self.queues[g].saturation_service(elapsed, dt, mult)
+                for veh_id in self.queues[g].discharge(service):
+                    departures.append((veh_id, g))
+            for g in phase.permissive_lefts:
+                service = self._permissive_service(g) * dt
+                for veh_id in self.queues[g].discharge(service):
+                    departures.append((veh_id, g))
+
+        departures_by_group = np.zeros(N_MOVEMENTS, dtype=np.int64)
+        for veh_id, g in departures:
+            self.log.veh_depart[veh_id] = t_new
+            departures_by_group[g] += 1
 
         # 5. Bookkeeping.
         queue_lengths = tuple(len(q) for q in self.queues)
@@ -162,9 +215,14 @@ class IntersectionSim:
         peds_waiting = sum(len(w) for w in self.waiting_peds)
         info = {
             "t": t_new,
-            "departures_this_step": departures,
-            "departures_by_approach": departures_by_approach,
-            "arrivals_by_approach": arrivals,
+            "departures_this_step": len(departures),
+            "departures_by_group": departures_by_group,
+            "arrivals_by_group": arrivals,
+            # Legacy per-approach views (through + left of each approach).
+            "departures_by_approach": (
+                departures_by_group[:N_APPROACHES] + departures_by_group[N_APPROACHES:]
+            ),
+            "arrivals_by_approach": arrivals[:N_APPROACHES] + arrivals[N_APPROACHES:],
             "total_queue": total_queue,
             "wait_accrued_this_step": total_queue * dt,
             "peds_waiting": peds_waiting,
@@ -174,11 +232,53 @@ class IntersectionSim:
 
     # ------------------------------------------------------------------ helpers
 
-    def _conflicting_call(self, phase: int) -> bool:
-        conflicting_approaches = PHASE_APPROACHES[(phase + 1) % N_PHASES]
-        if any(len(self.queues[a]) > 0 for a in conflicting_approaches):
-            return True
-        return bool(self.ped_call_pending[(phase + 1) % N_PED_MOVEMENTS])
+    def _shared_left_multiplier(self, group: int) -> float:
+        """Discharge multiplier for a through group whose lane carries SHARED
+        lefts: the left share flows at the permissive rate, the rest at
+        saturation. Point-queue approximation, applied to the whole group."""
+        if group >= N_APPROACHES:
+            return 1.0
+        approach = group
+        demand = self.streams.demand_now(self.t)
+        p_left = demand.shared_left_fraction(approach, self.config.layout)
+        if p_left <= 0.0:
+            return 1.0
+        c_perm = self._permissive_service(left_group(approach), from_approach=approach)
+        s_lane = self.config.sat_flow  # single-lane saturation, veh/s
+        return (1.0 - p_left) + p_left * min(c_perm / s_lane, 1.0)
+
+    def _permissive_service(self, group: int, from_approach: int | None = None) -> float:
+        """Gap-acceptance service rate (veh/s) for a left group filtering
+        through opposing traffic. Zero while the opposing through queue is
+        discharging (no gaps); otherwise the classic exponential-gap capacity
+        against the opposing arrival-rate estimate."""
+        approach = from_approach if from_approach is not None else group - N_APPROACHES
+        opposing = OPPOSING[approach]
+        if len(self.queues[through_group(opposing)]) > 0:
+            return 0.0
+        return permissive_capacity(self._through_rate_ema[opposing])
+
+    def _served_groups(self, phase_idx: int) -> tuple[int, ...]:
+        p = self.phases[phase_idx]
+        return p.movements + p.permissive_lefts
+
+    def _conflicting_call(self, phase_idx: int) -> bool:
+        served = set(self._served_groups(phase_idx))
+        for g in range(N_MOVEMENTS):
+            if g not in served and len(self.queues[g]) > 0:
+                return True
+        current_ped = self.phases[phase_idx].ped_movement
+        return any(
+            self.ped_call_pending[m] for m in range(N_PED_MOVEMENTS) if m != current_ped
+        )
+
+    def _phase_calls(self) -> np.ndarray:
+        calls = np.zeros(self.n_phases, dtype=bool)
+        for i, p in enumerate(self.phases):
+            has_veh = any(len(self.queues[g]) > 0 for g in p.movements + p.permissive_lefts)
+            has_ped = p.ped_movement is not None and self.ped_call_pending[p.ped_movement]
+            calls[i] = has_veh or has_ped
+        return calls
 
     def _serve_walk(self, movement: int, t: float) -> None:
         for ped_id in self.waiting_peds[movement]:
@@ -189,13 +289,13 @@ class IntersectionSim:
     def _observe(self) -> Observation:
         t = self.t
         queue_lengths = np.array([len(q) for q in self.queues], dtype=np.float64)
-        oldest_wait = np.zeros(N_APPROACHES)
-        gaps = np.zeros(N_APPROACHES)
-        for a, q in enumerate(self.queues):
+        oldest_wait = np.zeros(N_MOVEMENTS)
+        gaps = np.zeros(N_MOVEMENTS)
+        for g, q in enumerate(self.queues):
             oldest = q.oldest_arrival()
-            oldest_wait[a] = (t - oldest) if oldest is not None else 0.0
-            gaps[a] = min(t - q.last_arrival_t, _GAP_CAP)
-        phase_onehot = np.zeros(N_PHASES)
+            oldest_wait[g] = (t - oldest) if oldest is not None else 0.0
+            gaps[g] = min(t - q.last_arrival_t, _GAP_CAP)
+        phase_onehot = np.zeros(self.n_phases)
         phase_onehot[self.signal.phase] = 1.0
         state_onehot = np.zeros(3)
         state_onehot[int(self.signal.state)] = 1.0
@@ -212,4 +312,6 @@ class IntersectionSim:
             ),
             ped_call=self.ped_call_pending.astype(np.float64),
             action_mask=self.signal.legal_actions(),
+            phase_slots=self._phase_slots,
+            group_lanes=self._group_lanes,
         )

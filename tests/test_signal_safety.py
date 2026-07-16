@@ -67,9 +67,9 @@ def test_invariants(busy_config, controller):
     # Logged state at step t applies to [t, t+dt): a walk starting at w must keep
     # the signal green on phase m for all steps in [w, w + ped_service).
     for w, m in walk_starts:
-        if w + timing.ped_service > horizon:
+        if w + timing.ped_service(0) > horizon:
             continue
-        window = (t >= w) & (t < w + timing.ped_service)
+        window = (t >= w) & (t < w + timing.ped_service(0))
         assert (states[window] == GREEN).all(), "walk truncated: not green throughout"
         assert (phases[window] == m).all(), "walk truncated: phase changed"
 
@@ -81,6 +81,6 @@ def test_backstop_forces_switch(busy_config):
     runs = _runs(log["step_state"], log["step_phase"])
     green_lengths = [length for state, _, length in runs if state == GREEN]
     # Backstop 120 s, plus at most one ped service (20 s) of lock overrun.
-    limit = busy_config.timing.max_green_backstop + busy_config.timing.ped_service
+    limit = busy_config.timing.max_green_backstop + busy_config.timing.ped_service(0)
     assert max(green_lengths) * busy_config.dt <= limit + 1.0
     assert len(green_lengths) > 50, "backstop should force regular switching"

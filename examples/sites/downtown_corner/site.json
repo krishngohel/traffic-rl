@@ -1,0 +1,9 @@
+{
+  "_comment": "Representative downtown grid corner. Narrow 25 mph one-lane-per-direction streets, NO left-turn bays (lefts share the through lane), heavy midday pedestrians. Volumes and geometry are typical published values, not a surveyed site.",
+  "ns_speed_mph": 25,
+  "ew_speed_mph": 25,
+  "ns_street_width_m": 12.0,
+  "ew_street_width_m": 12.0,
+  "through_lanes": [1, 1, 1, 1],
+  "left_bays": [false, false, false, false]
+}

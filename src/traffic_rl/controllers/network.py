@@ -19,12 +19,15 @@ from collections.abc import Callable
 
 import numpy as np
 
-from traffic_rl.config import N_PHASES, PHASE_APPROACHES
+from traffic_rl.config import N_MOVEMENTS, TWO_PHASE
 from traffic_rl.controllers.base import Controller, Observation
 from traffic_rl.controllers.fixed_time import NAIVE_PLAN, FixedTimeController, FixedTimePlan
 from traffic_rl.sim.network import EASTBOUND, WESTBOUND, NetworkConfig
 
 C_MIN, C_MAX = 40.0, 150.0
+# The corridor model is through-only (stated limit): every node runs the
+# legacy 2-phase table, so phase p serves the through groups TWO_PHASE[p].movements.
+_N_PHASES = len(TWO_PHASE)
 
 
 class NetworkController(ABC):
@@ -64,16 +67,17 @@ class _OffsetFixedTime(FixedTimeController):
 
 
 def _plan_for_cycle(flows: np.ndarray, cycle: float, timing) -> FixedTimePlan:
-    """Webster-style splits for a GIVEN common cycle, with the ped floor."""
+    """Webster-style splits for a GIVEN common cycle, with the ped floor.
+    `flows` is per lane group (8,); the corridor's nodes are through-only."""
     sat = 1800.0
     y = np.array(
-        [max(flows[a] for a in PHASE_APPROACHES[p]) / sat for p in range(N_PHASES)]
+        [max(flows[g] for g in TWO_PHASE[p].movements) / sat for p in range(_N_PHASES)]
     )
     y = np.maximum(y, 1e-6)
-    L = N_PHASES * timing.lost_time_per_phase
-    floor_eff = max(timing.ped_service, timing.min_green) - timing.startup_lost
+    L = _N_PHASES * timing.lost_time_per_phase
+    floor_eff = max(timing.ped_service(0), timing.min_green) - timing.startup_lost
     g_eff = (y / y.sum()) * (cycle - L)
-    for p in range(N_PHASES):
+    for p in range(_N_PHASES):
         if g_eff[p] < floor_eff:
             deficit = floor_eff - g_eff[p]
             g_eff[p] += deficit
@@ -89,7 +93,7 @@ class GreenWaveController(NetworkController):
 
     def reset(self, config: NetworkConfig, rng: np.random.Generator) -> None:
         self.config = config
-        self._counts = np.zeros((config.n_nodes, 4))
+        self._counts = np.zeros((config.n_nodes, N_MOVEMENTS))
         self._naive = [FixedTimeController(NAIVE_PLAN) for _ in range(config.n_nodes)]
         for i, c in enumerate(self._naive):
             c.reset(config.node_config(i), rng)
@@ -110,11 +114,15 @@ class GreenWaveController(NetworkController):
         flows = self._counts / self.observation_window * 3600.0
         # Common cycle: the largest per-node Webster cycle (the busiest node
         # binds the corridor), with the ped-floor min-cycle rule applied.
-        from traffic_rl.controllers.webster import webster_plan
+        from traffic_rl.controllers.webster import phase_floors, webster_plan
 
+        sat = np.full(N_MOVEMENTS, 1800.0)
         cycles = []
         for i in range(self.config.n_nodes):
-            plan = webster_plan(flows[i], 1800.0, timing, green_floor=timing.ped_service)
+            plan = webster_plan(
+                flows[i], sat, timing, TWO_PHASE,
+                green_floors=phase_floors(TWO_PHASE, timing),
+            )
             cycles.append(plan.cycle(timing.yellow, timing.all_red))
         common = float(np.clip(max(cycles), C_MIN, C_MAX))
         self._coordinated = []
@@ -199,9 +207,9 @@ class NetworkMaxPressureController(NetworkController):
                     [
                         sum(
                             obs.queue_lengths[a] - self._downstream(observations, i, a)
-                            for a in PHASE_APPROACHES[p]
+                            for a in TWO_PHASE[p].movements
                         )
-                        for p in range(N_PHASES)
+                        for p in range(_N_PHASES)
                     ]
                 )
                 if pressures.max() > pressures[obs.phase]:

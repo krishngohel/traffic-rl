@@ -2,7 +2,9 @@
 
 Drives both the naive 50/50 baseline and Webster-optimized plans. Uses the
 absolute sim clock, so if the state machine delays a switch (ped lock), the plan
-re-synchronizes on the next cycle instead of drifting.
+re-synchronizes on the next cycle instead of drifting. Green lengths are per
+phase in the config's phase-table order (e.g. NS-left, NS-through, EW-left,
+EW-through for a protected-left site).
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from traffic_rl.config import N_PHASES, SimConfig
+from traffic_rl.config import SimConfig
 from traffic_rl.controllers.base import Controller, Observation
 
 
@@ -20,30 +22,48 @@ class FixedTimePlan:
     greens: tuple[float, ...]  # actual signal green per phase, seconds
 
     def cycle(self, yellow: float, all_red: float) -> float:
-        return sum(self.greens) + N_PHASES * (yellow + all_red)
+        """Cycle length under uniform clearance intervals (legacy two-phase
+        callers: the corridor stack). Prefer cycle_for(config) for per-phase
+        clearances."""
+        return sum(self.greens) + len(self.greens) * (yellow + all_red)
+
+    def cycle_for(self, config: SimConfig) -> float:
+        timing = config.timing
+        phases = config.phases
+        assert len(self.greens) == len(phases), (
+            f"plan has {len(self.greens)} greens for {len(phases)} phases"
+        )
+        return sum(
+            g + timing.yellow_for(p) + timing.all_red_for(p)
+            for g, p in zip(self.greens, phases, strict=True)
+        )
 
 
 class FixedTimeController(Controller):
     name = "fixed"
 
-    def __init__(self, plan: FixedTimePlan):
+    def __init__(self, plan: FixedTimePlan | None):
+        """plan=None -> equal 25 s greens per phase (the naive baseline)."""
         self.plan = plan
 
     def reset(self, config: SimConfig, rng: np.random.Generator) -> None:
-        y, ar = config.timing.yellow, config.timing.all_red
-        self._cycle = self.plan.cycle(y, ar)
+        timing = config.timing
+        phases = config.phases
+        plan = self.plan if self.plan is not None else naive_plan(config)
+        self._cycle = plan.cycle_for(config)
+        self._n_phases = len(phases)
         # Phase p owns the clock segment [starts[p], starts[p+1]).
         starts = [0.0]
-        for g in self.plan.greens:
-            starts.append(starts[-1] + g + y + ar)
+        for g, p in zip(plan.greens, phases, strict=True):
+            starts.append(starts[-1] + g + timing.yellow_for(p) + timing.all_red_for(p))
         self._starts = starts
 
     def act(self, obs: Observation) -> int:
         c = obs.t % self._cycle
-        for p in range(N_PHASES):
+        for p in range(self._n_phases):
             if c < self._starts[p + 1]:
                 return p
-        return N_PHASES - 1
+        return self._n_phases - 1
 
 
 class ScheduledFixedTimeController(Controller):
@@ -73,8 +93,13 @@ class ScheduledFixedTimeController(Controller):
         return active.act(obs)
 
 
-# 60 s cycle: 25 s green each (23 s effective after 2 s startup), 3 y + 2 ar per
-# phase. Demand-blind 50/50 — the naive baseline.
+def naive_plan(config: SimConfig) -> FixedTimePlan:
+    """Demand-blind equal split: 25 s green per phase, whatever the phases are.
+    For the legacy 2-phase layout this is the original 60 s naive cycle."""
+    return FixedTimePlan(greens=(25.0,) * config.n_phases)
+
+
+# Legacy alias: the Phase 1-4 naive plan for the 2-phase layout.
 NAIVE_PLAN = FixedTimePlan(greens=(25.0, 25.0))
 
 
@@ -82,4 +107,4 @@ class NaiveController(FixedTimeController):
     name = "naive"
 
     def __init__(self) -> None:
-        super().__init__(NAIVE_PLAN)
+        super().__init__(None)  # equal split, sized to the config's phase count

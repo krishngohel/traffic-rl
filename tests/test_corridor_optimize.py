@@ -74,7 +74,7 @@ def test_corridor_candidates_share_common_cycle():
         cycles = {round(p.cycle(y, ar), 6) for p in cand.node_plans}
         assert len(cycles) == 1, "coordination requires one common cycle"
         for plan in cand.node_plans:
-            assert min(plan.greens) >= timing.ped_service - 1e-6
+            assert min(plan.greens) >= timing.ped_service(0) - 1e-6
 
 
 def test_scheduled_coordinated_controller_runs_and_switches(corridor_path):
