@@ -24,6 +24,7 @@ from traffic_rl.eval.metrics import (
     mean_ci,
     paired_diff_ci,
 )
+from traffic_rl.eval.parallel import RunPool, run_network_task
 from traffic_rl.sim.network import NetworkConfig, NetworkDemandConfig, NetworkSim
 
 NETWORK_SCENARIOS: dict[str, NetworkDemandConfig] = {
@@ -129,16 +130,20 @@ def run_network_experiment(
     base_seed: int,
     out_dir: Path,
     n_nodes: int = 4,
+    jobs: int | None = None,
 ) -> None:
-    registry = network_controller_registry()
     seeds = [int(s) for s in np.random.SeedSequence(base_seed).generate_state(n_runs)]
+    pool = RunPool(jobs)
     for scenario in scenarios:
         config = NetworkConfig(demand=NETWORK_SCENARIOS[scenario], n_nodes=n_nodes)
-        per_controller: dict[str, list[dict]] = {}
-        for name in controllers:
-            t0 = time.perf_counter()
-            runs = [run_network_controller(registry[name](), config, s) for s in seeds]
-            per_controller[name] = runs
+        t0 = time.perf_counter()
+        tasks = [(("network", name), config, s) for name in controllers for s in seeds]
+        flat = pool.map(run_network_task, tasks)
+        scenario_wall = time.perf_counter() - t0
+        per_controller: dict[str, list[dict]] = {
+            name: flat[i * n_runs : (i + 1) * n_runs] for i, name in enumerate(controllers)
+        }
+        for name, runs in per_controller.items():
             dest = out_dir / scenario / name
             dest.mkdir(parents=True, exist_ok=True)
             scalar_keys = [k for k in runs[0] if k not in _ARRAY_KEYS]
@@ -156,14 +161,16 @@ def run_network_experiment(
                 queue_timeseries=np.stack([r["queue_timeseries"] for r in runs]),
             )
             agg = mean_ci(np.array([r["p95_wait"] for r in runs]))
-            bound = "≥" if any(r["p95_is_lower_bound"] for r in runs) else " "
+            # ASCII only: cp1252 consoles raise UnicodeEncodeError on "≥".
+            bound = ">=" if any(r["p95_is_lower_bound"] for r in runs) else "  "
             print(
                 f"[{scenario:>14}] {name:<13} journey p95 {bound}{agg['mean']:7.1f} s "
-                f"(95% CI {agg['lo']:6.1f}–{agg['hi']:6.1f}, n={n_runs}) "
-                f"unstable {sum(r['unstable'] for r in runs)}/{n_runs}  "
-                f"[{time.perf_counter() - t0:.1f}s wall]"
+                f"(95% CI {agg['lo']:6.1f}-{agg['hi']:6.1f}, n={n_runs}) "
+                f"unstable {sum(r['unstable'] for r in runs)}/{n_runs}"
             )
+        print(f"[{scenario:>14}] {scenario_wall:.1f}s wall ({pool.jobs} workers)")
         _write_summary(out_dir / scenario, scenario, config, per_controller, seeds)
+    pool.close()
 
 
 def _write_summary(dest, scenario, config, per_controller, seeds) -> None:
@@ -210,9 +217,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--nodes", type=int, default=4)
     parser.add_argument("--out", type=Path, default=Path("results") / "network")
+    parser.add_argument(
+        "--jobs", type=int, default=None,
+        help="worker processes (default: all cores; 1 = serial)",
+    )
     args = parser.parse_args()
     run_network_experiment(
-        args.controllers, args.scenarios, args.runs, args.seed, args.out, n_nodes=args.nodes
+        args.controllers, args.scenarios, args.runs, args.seed, args.out,
+        n_nodes=args.nodes, jobs=args.jobs,
     )
 
 

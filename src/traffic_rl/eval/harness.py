@@ -21,6 +21,7 @@ import numpy as np
 from traffic_rl.config import SimConfig
 from traffic_rl.controllers import CONTROLLER_REGISTRY
 from traffic_rl.eval.metrics import compute_run_metrics, mean_ci, paired_diff_ci
+from traffic_rl.eval.parallel import RunPool, run_single_task
 from traffic_rl.scenarios import SCENARIOS, make_config
 from traffic_rl.sim.core import IntersectionSim
 
@@ -62,26 +63,37 @@ def run_experiment(
     n_runs: int,
     base_seed: int,
     out_dir: Path,
+    jobs: int | None = None,
 ) -> None:
     seeds = run_seeds(base_seed, n_runs)
-    for scenario in scenarios:
-        config = make_config(scenario)
-        per_controller: dict[str, list[dict]] = {}
-        for name in controllers:
+    with RunPool(jobs) as pool:
+        for scenario in scenarios:
+            config = make_config(scenario)
             t0 = time.perf_counter()
-            runs = [run_single(name, config, seed) for seed in seeds]
-            per_controller[name] = runs
-            _write_controller_outputs(out_dir / scenario / name, runs)
+            # One flat batch per scenario: every (controller, seed) episode is
+            # independent, so they all pack the pool together.
+            tasks = [
+                (("registry", name), config, seed) for name in controllers for seed in seeds
+            ]
+            flat = pool.map(run_single_task, tasks)
             wall = time.perf_counter() - t0
-            agg = mean_ci(np.array([r["p95_wait"] for r in runs]))
-            bound = "≥" if any(r["p95_is_lower_bound"] for r in runs) else " "
-            print(
-                f"[{scenario:>10}] {name:<13} p95 {bound}{agg['mean']:7.1f} s "
-                f"(95% CI {agg['lo']:6.1f}–{agg['hi']:6.1f}, n={n_runs}) "
-                f"unstable {sum(r['unstable'] for r in runs)}/{n_runs}  "
-                f"[{wall:.1f}s wall]"
-            )
-        _write_summary(out_dir / scenario, scenario, config, per_controller, seeds)
+            per_controller: dict[str, list[dict]] = {
+                name: flat[i * n_runs : (i + 1) * n_runs]
+                for i, name in enumerate(controllers)
+            }
+            for name, runs in per_controller.items():
+                _write_controller_outputs(out_dir / scenario / name, runs)
+                agg = mean_ci(np.array([r["p95_wait"] for r in runs]))
+                # ASCII only: Windows consoles often decode as cp1252, where
+                # "≥" raises UnicodeEncodeError and kills the run.
+                bound = ">=" if any(r["p95_is_lower_bound"] for r in runs) else "  "
+                print(
+                    f"[{scenario:>10}] {name:<13} p95 {bound}{agg['mean']:7.1f} s "
+                    f"(95% CI {agg['lo']:6.1f}-{agg['hi']:6.1f}, n={n_runs}) "
+                    f"unstable {sum(r['unstable'] for r in runs)}/{n_runs}"
+                )
+            print(f"[{scenario:>10}] {wall:.1f}s wall ({pool.jobs} workers)")
+            _write_summary(out_dir / scenario, scenario, config, per_controller, seeds)
 
 
 def _write_controller_outputs(dest: Path, runs: list[dict]) -> None:
@@ -151,6 +163,10 @@ def main() -> None:
     parser.add_argument("--runs", type=int, default=20)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out", type=Path, default=Path("results"))
+    parser.add_argument(
+        "--jobs", type=int, default=None,
+        help="worker processes (default: all cores; 1 = serial)",
+    )
     args = parser.parse_args()
     for c in args.controllers:
         if c not in CONTROLLER_REGISTRY:
@@ -158,7 +174,9 @@ def main() -> None:
     for s in args.scenarios:
         if s not in SCENARIOS:
             parser.error(f"unknown scenario {s!r}; choose from {sorted(SCENARIOS)}")
-    run_experiment(args.controllers, args.scenarios, args.runs, args.seed, args.out)
+    run_experiment(
+        args.controllers, args.scenarios, args.runs, args.seed, args.out, jobs=args.jobs
+    )
 
 
 if __name__ == "__main__":
