@@ -2,9 +2,15 @@
 
 Copies web/main.py plus the traffic_rl package (source + trained weights,
 minus caches) into web_build/, then runs pygbag to compile the WASM bundle.
-The deployable static site ends up in web_build/build/web/ — host it anywhere
-(Netlify drag-and-drop, GitHub Pages, any static server). Serve locally for
-testing with:  python -m pygbag --port 8000 web_build
+The deployable static site ends up in web_build/build/web/ — host it on any
+REAL domain (Netlify drag-and-drop, GitHub Pages, ...): the runtime then
+pulls numpy/pygame wheels from the public pygame-web CDN.
+
+LOCAL TESTING MUST USE PYGBAG'S OWN SERVER on the default port:
+    python -m pygbag --ume_block 0 web_build     # then open localhost:8000
+When the page is served from localhost, the runtime enters dev mode and
+expects wheels at the local /cdn/ path, which only pygbag's server provides —
+a plain static file server will die with ModuleNotFoundError: numpy.
 """
 
 from __future__ import annotations
@@ -32,7 +38,9 @@ def stage() -> None:
 
 
 def build(serve: bool = False) -> int:
-    args = [sys.executable, "-m", "pygbag"]
+    # ume_block 0: boot straight into the animation, no click-to-start gate
+    # (we play no audio, so no autoplay policy applies).
+    args = [sys.executable, "-m", "pygbag", "--ume_block", "0"]
     if not serve:
         args.append("--build")
     args.append(str(STAGE))

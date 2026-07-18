@@ -9,7 +9,16 @@ which stages this file plus the traffic_rl package into web_build/ and runs
 pygbag; the deployable site lands in web_build/build/web/.
 """
 
+# /// script
+# dependencies = [
+#   "numpy",
+#   "pygame-ce",
+# ]
+# ///
+
 import asyncio
+
+import numpy  # noqa: F401  (declared so pygbag stages the wasm wheel)
 
 from traffic_rl.viewer.app import ViewerApp
 
