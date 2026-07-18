@@ -2,10 +2,11 @@
 
 Software-projected 3D rendered with pygame-ce polygons (painter's algorithm,
 sun-shaded box geometry) — no extra dependencies beyond the [viewer] extra.
-Vehicles get a deterministic body style (sedan / SUV / pickup / van) and color
-from their id. Consumes the identical IntersectionSim + Controller objects the
-harness uses; rendering is decoupled from the 1 s sim timestep by an
-accumulator.
+Cars are animated continuously by viewer/anim.py: they drive in from upstream,
+brake into the queue, creep forward as it advances, then follow curved paths
+through the intersection (left / straight / right) and drive off. Approaches
+render three lanes — left-only, through, right-only — with painted arrows,
+and protected-left approaches get a second signal head with arrow lamps.
 
 Keys: Space pause · +/- speed · R reset with next seed · Esc quit.
 """
@@ -24,78 +25,101 @@ except ImportError as e:  # pragma: no cover
         "The viewer needs pygame-ce. Install it with: pip install traffic-rl[viewer]"
     ) from e
 
-from traffic_rl.config import left_group, through_group
+from traffic_rl.config import LeftTurnTreatment, left_group, through_group
 from traffic_rl.controllers import CONTROLLER_REGISTRY
 from traffic_rl.scenarios import SCENARIOS, make_config
 from traffic_rl.sim.core import IntersectionSim
 from traffic_rl.sim.signal import SignalState
+from traffic_rl.viewer.anim import LANE_X, ROAD_HALF, STOP, CarAnimator, to_world
 
-W, H = 1024, 800
+W, H = 1120, 840
 
-# ----------------------------------------------------------------- world layout
-# Meters. x east, y north, z up. Intersection center at origin.
-ROAD_HALF = 8.0  # two 4 m lanes per road
-STOP = 12.0  # stop-line distance from center
-LANE = 4.0  # lane-center offset from road centerline
-CAR_SPACING = 6.5
-QUEUE_START = 15.5  # first queued car's center distance from intersection center
-CROSSWALK_MID = 10.4  # crosswalk band center distance
-MAX_DRAWN_FAR, MAX_DRAWN_NEAR = 18, 8  # N/S extend away from camera; E toward it
-
-# Approach: (queue direction away from center, lane offset) — right-hand traffic.
-# N southbound (lane west), S northbound (east), E westbound (north), W eastbound.
-QUEUE_DIR = {0: (0.0, 1.0), 1: (0.0, -1.0), 2: (1.0, 0.0), 3: (-1.0, 0.0)}
-LANE_OFF = {0: (-LANE, 0.0), 1: (LANE, 0.0), 2: (0.0, LANE), 3: (0.0, -LANE)}
-MAX_DRAWN = {0: MAX_DRAWN_FAR, 1: MAX_DRAWN_FAR, 2: MAX_DRAWN_NEAR, 3: MAX_DRAWN_FAR}
+CROSSWALK_MID = 11.9  # crosswalk band center distance
+SIDEWALK_IN, SIDEWALK_OUT = ROAD_HALF + 0.15, ROAD_HALF + 2.6
 
 # ----------------------------------------------------------------------- colors
-GRASS = (74, 106, 66)
-ASPHALT = (52, 52, 56)
-PAINT = (222, 222, 214)
-CENTERLINE = (208, 170, 60)
+GRASS = (86, 118, 74)
+GRASS_DARK = (76, 106, 66)
+ASPHALT = (54, 54, 58)
+ASPHALT_SHADOW = (38, 38, 42)
+PAINT = (225, 225, 217)
+LANE_DASH = (200, 200, 192)
+CENTERLINE = (212, 172, 60)
 WALK_TINT = (140, 225, 150)
-POLE_COLOR = (70, 72, 76)
-HEAD_COLOR = (38, 38, 40)
+SIDEWALK = (152, 148, 140)
+POLE_COLOR = (72, 74, 78)
+HEAD_COLOR = (34, 34, 36)
 PED_COLOR = (235, 220, 190)
 HUD_INK = (235, 235, 225)
 HUD_DIM = (160, 160, 150)
-RED, AMBER, GREEN_ON = (225, 60, 50), (240, 175, 40), (80, 210, 90)
-LIGHT_OFF = (66, 66, 66)
+RED, AMBER, GREEN_ON = (228, 60, 50), (242, 178, 40), (84, 214, 92)
+LIGHT_OFF = (60, 60, 62)
+TRUNK = (96, 72, 52)
+FOLIAGE = [(58, 96, 52), (66, 108, 56), (52, 88, 60)]
+HEADLIGHT, TAILLIGHT = (240, 236, 200), (188, 42, 36)
+TIRE = (28, 28, 30)
 
 CAR_COLORS = [
-    (178, 40, 52),  # crimson
-    (58, 104, 188),  # blue
-    (188, 192, 198),  # silver
-    (236, 234, 226),  # white
-    (56, 58, 62),  # charcoal
-    (52, 122, 74),  # forest
-    (222, 122, 44),  # orange
-    (46, 148, 150),  # teal
+    (172, 38, 50),   # crimson
+    (56, 100, 182),  # blue
+    (186, 190, 196), # silver
+    (238, 236, 228), # white
+    (52, 54, 58),    # charcoal
+    (48, 118, 70),   # forest
+    (218, 118, 42),  # orange
+    (44, 144, 146),  # teal
+    (94, 70, 132),   # plum
+    (208, 176, 60),  # gold
 ]
 
-# Car body styles: list of (offset along heading, size (length, width, height),
-# base z, is_cabin). Cabins render as tinted glass (darkened body color).
+# Car body styles: (offset along heading, offset across, size (L, W, H),
+# base z, kind) where kind is "body" | "glass". Wheels and lights are added
+# procedurally from the footprint.
 CAR_MODELS = {
-    "sedan": [
-        ((0.0, 0.0), (4.4, 1.9, 1.0), 0.25, False),
-        ((-0.35, 0.0), (2.3, 1.7, 0.75), 1.25, True),
-    ],
-    "suv": [
-        ((0.0, 0.0), (4.6, 2.0, 1.45), 0.3, False),
-        ((-0.2, 0.0), (2.7, 1.85, 0.8), 1.75, True),
-    ],
-    "pickup": [
-        ((1.05, 0.0), (2.0, 2.0, 1.7), 0.3, False),
-        ((-1.35, 0.0), (2.7, 2.0, 0.95), 0.3, False),
-    ],
-    "van": [((0.0, 0.0), (5.0, 2.0, 2.1), 0.3, False)],
+    "sedan": {
+        "boxes": [
+            ((0.0, 0.0), (4.5, 1.9, 0.62), 0.34, "body"),
+            ((0.55, 0.0), (2.2, 1.82, 0.30), 0.96, "body"),   # hood
+            ((-0.35, 0.0), (2.3, 1.7, 0.72), 0.96, "glass"),  # cabin
+        ],
+        "foot": (4.5, 1.9),
+    },
+    "suv": {
+        "boxes": [
+            ((0.0, 0.0), (4.7, 2.0, 0.85), 0.40, "body"),
+            ((-0.15, 0.0), (3.0, 1.88, 0.85), 1.25, "glass"),
+        ],
+        "foot": (4.7, 2.0),
+    },
+    "pickup": {
+        "boxes": [
+            ((-1.35, 0.0), (2.1, 2.0, 0.9), 0.38, "body"),    # bed
+            ((0.45, 0.0), (2.9, 2.0, 0.95), 0.38, "body"),    # cab base
+            ((0.75, 0.0), (1.7, 1.9, 0.75), 1.33, "glass"),
+        ],
+        "foot": (5.1, 2.0),
+    },
+    "van": {
+        "boxes": [
+            ((0.0, 0.0), (5.1, 2.05, 1.15), 0.38, "body"),
+            ((0.4, 0.0), (3.6, 1.95, 0.95), 1.53, "glass"),
+        ],
+        "foot": (5.1, 2.05),
+    },
+    "coupe": {
+        "boxes": [
+            ((0.0, 0.0), (4.2, 1.85, 0.55), 0.32, "body"),
+            ((0.65, 0.0), (1.9, 1.78, 0.26), 0.87, "body"),
+            ((-0.5, 0.0), (1.9, 1.62, 0.58), 0.87, "glass"),
+        ],
+        "foot": (4.2, 1.85),
+    },
 }
 MODEL_NAMES = list(CAR_MODELS)
 
 SUN = np.array([-0.40, 0.30, -0.87])
 SUN = SUN / np.linalg.norm(SUN)
 
-# Six faces of a unit box as vertex-index quads + outward normals.
 _BOX_CORNERS = np.array(
     [[sx, sy, sz] for sz in (0, 1) for sy in (-0.5, 0.5) for sx in (-0.5, 0.5)]
 )
@@ -112,7 +136,7 @@ _BOX_FACES = [
 class Camera:
     """Elevated three-quarter perspective view from the east."""
 
-    def __init__(self, eye=(95.0, -15.0, 65.0), target=(0.0, 5.0, 0.0), focal=1000.0):
+    def __init__(self, eye=(108.0, -22.0, 74.0), target=(0.0, 4.0, 0.0), focal=1080.0):
         self.eye = np.asarray(eye, dtype=np.float64)
         self.focal = focal
         fwd = np.asarray(target) - self.eye
@@ -122,7 +146,6 @@ class Camera:
         self.up = np.cross(self.right, self.fwd)
 
     def project(self, pts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """(n,3) world points -> (n,2) screen coords + (n,) camera depths."""
         v = np.atleast_2d(pts) - self.eye
         d = np.maximum(v @ self.fwd, 0.5)
         sx = W / 2 + self.focal * (v @ self.right) / d
@@ -130,28 +153,73 @@ class Camera:
         return np.stack([sx, sy], axis=1), d
 
 
-def _shade(color, normal) -> tuple[int, int, int]:
-    b = 0.42 + 0.58 * max(0.0, float(np.dot(normal, -SUN)))
-    return tuple(min(255, int(c * b)) for c in color)
+_FACE_IDX = np.array([list(idx) for idx, _ in _BOX_FACES])  # (6, 4)
+_FACE_NORMALS = np.array([n for _, n in _BOX_FACES], dtype=np.float64)  # (6, 3)
 
 
-def box_faces(center, size, color, cam: Camera, out: list) -> None:
-    """Append (depth, screen_quad, shaded_color) faces of an axis-aligned box."""
-    center = np.asarray(center, dtype=np.float64)
-    size = np.asarray(size, dtype=np.float64)
-    corners = _BOX_CORNERS * size + center  # z of `center` is the box BASE
-    scr, _ = cam.project(corners)
-    for idx, n in _BOX_FACES:
-        normal = np.asarray(n, dtype=np.float64)
-        face_center = corners[list(idx)].mean(axis=0)
-        if np.dot(face_center - cam.eye, normal) >= 0:
-            continue  # backface
-        depth = float(np.linalg.norm(face_center - cam.eye))
-        out.append((depth, scr[list(idx)], _shade(color, normal)))
+class BoxBatch:
+    """Collects yawed boxes and projects/shades them all in one numpy pass —
+    per-box numpy calls were the viewer's frame-rate bottleneck."""
+
+    def __init__(self):
+        self.centers: list = []
+        self.sizes: list = []
+        self.yaws: list = []
+        self.colors: list = []
+
+    def add(self, center, size, color, yaw: float = 0.0) -> None:
+        self.centers.append(center)
+        self.sizes.append(size)
+        self.yaws.append(yaw)
+        self.colors.append(color)
+
+    def flush(self, cam: Camera, out: list) -> None:
+        if not self.centers:
+            return
+        centers = np.asarray(self.centers, dtype=np.float64)  # (n, 3)
+        sizes = np.asarray(self.sizes, dtype=np.float64)
+        yaws = np.asarray(self.yaws, dtype=np.float64)
+        colors = np.asarray(self.colors, dtype=np.float64)
+        n = len(centers)
+        corners = sizes[:, None, :] * _BOX_CORNERS[None, :, :]  # (n, 8, 3)
+        c, s = np.cos(yaws)[:, None], np.sin(yaws)[:, None]
+        x, y = corners[:, :, 0].copy(), corners[:, :, 1].copy()
+        corners[:, :, 0] = x * c - y * s
+        corners[:, :, 1] = x * s + y * c
+        corners += centers[:, None, :]
+        scr, _ = cam.project(corners.reshape(-1, 3))
+        scr = scr.reshape(n, 8, 2)
+        # Rotate the xy-plane face normals per box (z normals are unchanged).
+        normals = np.broadcast_to(_FACE_NORMALS, (n, 6, 3)).copy()
+        nx, ny = normals[:, :, 0].copy(), normals[:, :, 1].copy()
+        normals[:, :, 0] = nx * c - ny * s
+        normals[:, :, 1] = nx * s + ny * c
+        face_centers = corners[:, _FACE_IDX, :].mean(axis=2)  # (n, 6, 3)
+        view = face_centers - cam.eye
+        visible = np.einsum("nfk,nfk->nf", view, normals) < 0.0
+        depths = np.linalg.norm(view, axis=2)
+        bright = 0.40 + 0.60 * np.maximum(0.0, -(normals @ SUN))
+        shaded = np.minimum(255, colors[:, None, :] * bright[:, :, None]).astype(np.uint8)
+        for i in range(n):
+            for f in range(6):
+                if visible[i, f]:
+                    out.append(
+                        (float(depths[i, f]), scr[i, _FACE_IDX[f]], tuple(shaded[i, f]))
+                    )
+        self.centers.clear()
+        self.sizes.clear()
+        self.yaws.clear()
+        self.colors.clear()
 
 
 def _flat_quad(cam: Camera, screen, corners_xy, color, z=0.02) -> None:
     pts = np.array([[x, y, z] for x, y in corners_xy])
+    scr, _ = cam.project(pts)
+    pygame.draw.polygon(screen, color, [tuple(p) for p in scr])
+
+
+def _flat_poly(cam: Camera, screen, pts_xy, color, z=0.03) -> None:
+    pts = np.array([[x, y, z] for x, y in pts_xy])
     scr, _ = cam.project(pts)
     pygame.draw.polygon(screen, color, [tuple(p) for p in scr])
 
@@ -161,8 +229,34 @@ def _car_style(veh_id: int) -> tuple[str, tuple[int, int, int]]:
     return MODEL_NAMES[(h >> 4) % len(MODEL_NAMES)], CAR_COLORS[(h >> 9) % len(CAR_COLORS)]
 
 
+ROLLING_WINDOW = 3600.0  # seconds of recent departures for the rolling mean wait
+AUTOSAVE_EVERY = 100_000  # learner steps between weight autosaves
+
+# Fixed scenery positions (world meters), clear of roads and sidewalks.
+TREES = [
+    (-20, 20, 1.00), (-34, 30, 0.85), (-48, 19, 1.1), (-22, 46, 0.9),
+    (20, 24, 0.95), (33, 38, 1.05), (-26, -22, 1.0), (-44, -30, 0.9),
+    (22, -20, 0.85), (38, -27, 1.0), (-58, -18, 0.95), (52, 20, 0.9),
+]
+BUILDINGS = [
+    ((-40, 44), (17, 13, 8.5), (168, 152, 132)),
+    ((-62, 26), (12, 11, 6.0), (150, 140, 128)),
+    ((34, 52), (15, 12, 7.0), (160, 146, 138)),
+    ((-38, -44), (14, 12, 6.5), (156, 148, 130)),
+]
+
+
 class ViewerApp:
-    def __init__(self, controller_name: str, scenario: str, speed: float, seed: int):
+    def __init__(
+        self,
+        controller_name: str,
+        scenario: str,
+        speed: float,
+        seed: int,
+        learn: bool = False,
+        learn_fresh: bool = False,
+        learn_out=None,
+    ):
         self.controller_name = controller_name
         self.scenario = scenario
         self.speed = speed
@@ -171,74 +265,173 @@ class ViewerApp:
         self.sim = IntersectionSim(self.config)
         self.cam = Camera()
         self.paused = False
+        self._ground_cache: dict = {}
+        self.animator = CarAnimator(self.config)
+        self.learner = None
+        self.learn_out = None
+        if learn:
+            from traffic_rl.rl.online import DEFAULT_ONLINE_OUT, OnlineLearner
+
+            self.learner = OnlineLearner(seed, fresh=learn_fresh)
+            self.learn_out = learn_out or DEFAULT_ONLINE_OUT
+            self._last_autosave = 0
         self._reset()
 
     def _reset(self) -> None:
-        self.controller = CONTROLLER_REGISTRY[self.controller_name]()
+        self.controller = (
+            None if self.learner else CONTROLLER_REGISTRY[self.controller_name]()
+        )
         self.obs = self.sim.reset(self.seed)
-        self.controller.reset(self.config, np.random.default_rng(self.seed))
+        if self.learner:
+            self.learner.on_reset()
+        else:
+            self.controller.reset(self.config, np.random.default_rng(self.seed))
+        self.animator.reset()
         self._acc = 0.0
+        self._anim_t = self.sim.t
         self._mean_wait = 0.0
+        self._rolling_wait = 0.0
         self._n_departed = 0
+        # Per-phase green timings shown at each pole: planned greens for
+        # fixed-time controllers, measured last-completed green otherwise.
+        self._phase_green: dict[int, float] = {}
+        self._green_planned = False
+        self._prev_sig: tuple | None = None
+        self._seed_plan_greens()
+
+    def _seed_plan_greens(self) -> None:
+        from traffic_rl.controllers.fixed_time import FixedTimeController, naive_plan
+
+        # Only a static fixed-time plan is known ahead of time; every other
+        # controller (actuated, RL, scheduled TOD) shows measured greens.
+        if isinstance(self.controller, FixedTimeController):
+            plan = self.controller.plan or naive_plan(self.config)
+            self._phase_green = dict(enumerate(plan.greens))
+            self._green_planned = True
+
+    def _track_green_times(self) -> None:
+        """Record each phase's completed green duration from the state machine
+        (the ground truth for every controller, adaptive ones included)."""
+        sig = self.sim.signal
+        if self._prev_sig is not None:
+            p_phase, p_state, p_elapsed = self._prev_sig
+            ended = p_state == SignalState.GREEN and (
+                sig.state != SignalState.GREEN or sig.phase != p_phase
+            )
+            if ended and not self._green_planned:
+                self._phase_green[p_phase] = p_elapsed + self.config.dt
+        self._prev_sig = (sig.phase, sig.state, sig.state_elapsed)
 
     def _advance(self, frame_dt: float) -> None:
         self._acc += self.speed * frame_dt
         dt = self.config.dt
         while self._acc >= dt:
-            self.obs = self.sim.step(self.controller.act(self.obs)).obs
+            if self.learner:
+                result = self.sim.step(self.learner.act(self.obs))
+                self.learner.observe(result)
+                self.obs = result.obs
+            else:
+                self.obs = self.sim.step(self.controller.act(self.obs)).obs
+            self.animator.on_sim_step(self.sim)
+            self._track_green_times()
             self._acc -= dt
+        # Continuous animation clock: sim time plus the un-stepped remainder.
+        new_anim_t = self.sim.t + self._acc
+        self.animator.update(max(0.0, new_anim_t - self._anim_t))
+        self._anim_t = new_anim_t
+        if self.learner and self.learner.steps - self._last_autosave >= AUTOSAVE_EVERY:
+            self.learner.save(self.learn_out)
+            self._last_autosave = self.learner.steps
         dep = np.asarray(self.sim.log.veh_depart)
         if len(dep) and len(dep) != self._n_departed:
             arr = np.asarray(self.sim.log.veh_arrival)
             done = ~np.isnan(dep)
             if done.any():
-                self._mean_wait = float((dep[done] - arr[done]).mean())
+                waits = dep[done] - arr[done]
+                self._mean_wait = float(waits.mean())
+                recent = dep[done] >= self.sim.t - ROLLING_WINDOW
+                if recent.any():
+                    self._rolling_wait = float(waits[recent].mean())
             self._n_departed = len(dep)
 
     # ------------------------------------------------------------------ drawing
 
     def draw(self, screen: pygame.Surface, font: pygame.font.Font) -> None:
-        screen.fill(GRASS)
-        self._draw_ground(screen)
-        faces: list = []
-        overflow_labels: list[tuple[np.ndarray, str]] = []
+        self._blit_ground(screen)
+        self._draw_car_shadows(screen)
+        batch = BoxBatch()
         for a in range(4):
-            self._queue_faces(a, faces, overflow_labels)
-            self._signal_pole_faces(a, faces)
-        self._ped_faces(faces)
-        faces.sort(key=lambda f: -f[0])  # painter: far to near
+            self._signal_pole_faces(a, batch)
+        self._car_faces(batch)
+        self._ped_faces(batch)
+        self._scenery_faces(batch)
+        faces: list = []
+        batch.flush(self.cam, faces)
+        faces.sort(key=lambda f: -f[0])
         for _, quad, color in faces:
             pygame.draw.polygon(screen, color, [tuple(p) for p in quad])
         self._draw_signal_lamps(screen)
-        for pos, text in overflow_labels:
-            label = font.render(text, True, HUD_INK)
-            screen.blit(label, label.get_rect(center=(int(pos[0]), int(pos[1]))))
+        self._draw_timing_labels(screen, font)
+        self._draw_overflow_labels(screen, font)
         self._draw_hud(screen, font)
+
+    # ------------------------------------------------------------ ground layer
+
+    def _blit_ground(self, screen) -> None:
+        """The ground never moves; only the crosswalk walk-tint changes. Cache
+        one fully drawn surface per walk state and blit it."""
+        key = (self._crosswalk_active(0), self._crosswalk_active(1))
+        surf = self._ground_cache.get(key)
+        if surf is None:
+            surf = pygame.Surface((W, H))
+            surf.fill(GRASS)
+            self._draw_ground(surf)
+            self._ground_cache[key] = surf
+        screen.blit(surf, (0, 0))
 
     def _draw_ground(self, screen) -> None:
         cam = self.cam
-        # Roads (extents chosen to stay in front of the camera).
-        _flat_quad(cam, screen, [(-ROAD_HALF, -90), (ROAD_HALF, -90), (ROAD_HALF, 140),
-                                 (-ROAD_HALF, 140)], ASPHALT, z=0.0)
-        _flat_quad(cam, screen, [(-100, -ROAD_HALF), (70, -ROAD_HALF), (70, ROAD_HALF),
-                                 (-100, ROAD_HALF)], ASPHALT, z=0.0)
-        # Center lines, interrupted at the intersection box.
-        for y0, y1 in ((-90, -ROAD_HALF), (ROAD_HALF, 140)):
-            _flat_quad(cam, screen, [(-0.15, y0), (0.15, y0), (0.15, y1), (-0.15, y1)],
-                       CENTERLINE)
-        for x0, x1 in ((-100, -ROAD_HALF), (ROAD_HALF, 70)):
-            _flat_quad(cam, screen, [(x0, -0.15), (x1, -0.15), (x1, 0.15), (x0, 0.15)],
-                       CENTERLINE)
-        # Stop lines across the approach lane only.
-        _flat_quad(cam, screen, [(-ROAD_HALF, STOP), (-0.3, STOP), (-0.3, STOP + 0.6),
-                                 (-ROAD_HALF, STOP + 0.6)], PAINT)  # N
-        _flat_quad(cam, screen, [(0.3, -STOP - 0.6), (ROAD_HALF, -STOP - 0.6),
-                                 (ROAD_HALF, -STOP), (0.3, -STOP)], PAINT)  # S
-        _flat_quad(cam, screen, [(STOP, 0.3), (STOP + 0.6, 0.3), (STOP + 0.6, ROAD_HALF),
-                                 (STOP, ROAD_HALF)], PAINT)  # E
-        _flat_quad(cam, screen, [(-STOP - 0.6, -ROAD_HALF), (-STOP, -ROAD_HALF),
-                                 (-STOP, -0.3), (-STOP - 0.6, -0.3)], PAINT)  # W
+        # Grass patches for slight tonal variation.
+        for x, y, s in ((-55, 35, 26), (40, -30, 22), (-30, -50, 24), (48, 42, 20)):
+            _flat_quad(cam, screen, [(x - s, y - s), (x + s, y - s), (x + s, y + s),
+                                     (x - s, y + s)], GRASS_DARK, z=0.0)
+        # Sidewalk aprons around each road, then asphalt on top.
+        for lo, hi in ((-SIDEWALK_OUT, SIDEWALK_OUT),):
+            _flat_quad(cam, screen, [(lo, -95), (hi, -95), (hi, 145), (lo, 145)],
+                       SIDEWALK, z=0.005)
+            _flat_quad(cam, screen, [(-105, lo), (75, lo), (75, hi), (-105, hi)],
+                       SIDEWALK, z=0.005)
+        _flat_quad(cam, screen, [(-ROAD_HALF, -95), (ROAD_HALF, -95), (ROAD_HALF, 145),
+                                 (-ROAD_HALF, 145)], ASPHALT, z=0.01)
+        _flat_quad(cam, screen, [(-105, -ROAD_HALF), (75, -ROAD_HALF), (75, ROAD_HALF),
+                                 (-105, ROAD_HALF)], ASPHALT, z=0.01)
+        self._draw_road_markings(screen)
         self._draw_crosswalks(screen)
+        self._draw_lane_arrows(screen)
+
+    def _draw_road_markings(self, screen) -> None:
+        cam = self.cam
+        far = 95
+        for a in range(4):
+            # Double yellow centerline from the crosswalk outward.
+            for xo in (-0.55, -0.15):
+                quad = [(xo - 0.13, STOP), (xo + 0.13, STOP), (xo + 0.13, far),
+                        (xo - 0.13, far)]
+                _flat_quad(cam, screen, [to_world(a, x, y) for x, y in quad],
+                           CENTERLINE)
+            # Dashed white lane dividers between L|S and S|R lanes.
+            for xd in (-3.4, -6.8):
+                y = STOP + 1.5
+                while y < far:
+                    quad = [(xd - 0.1, y), (xd + 0.1, y), (xd + 0.1, y + 2.2),
+                            (xd - 0.1, y + 2.2)]
+                    _flat_quad(cam, screen, [to_world(a, x, yy) for x, yy in quad],
+                               LANE_DASH)
+                    y += 5.5
+            # Stop line across the three approach lanes.
+            quad = [(-ROAD_HALF + 0.2, STOP), (-0.9, STOP), (-0.9, STOP + 0.55),
+                    (-ROAD_HALF + 0.2, STOP + 0.55)]
+            _flat_quad(cam, screen, [to_world(a, x, y) for x, y in quad], PAINT)
 
     def _crosswalk_active(self, movement: int) -> bool:
         sig = self.sim.signal
@@ -246,71 +439,133 @@ class ViewerApp:
 
     def _draw_crosswalks(self, screen) -> None:
         cam = self.cam
-        half_band = 1.2
-        # Movement 0: walks parallel to NS traffic, crossing the EW street at
-        # x = ±CROSSWALK_MID; zebra bars are long in x, repeating along y.
+        half_band = 1.15
         color0 = WALK_TINT if self._crosswalk_active(0) else PAINT
         for side in (-1, 1):
             x0 = side * CROSSWALK_MID - half_band
-            for yb in np.arange(-ROAD_HALF + 0.4, ROAD_HALF - 0.4, 1.4):
+            for yb in np.arange(-ROAD_HALF + 0.5, ROAD_HALF - 0.5, 1.5):
                 _flat_quad(cam, screen, [(x0, yb), (x0 + 2 * half_band, yb),
-                                         (x0 + 2 * half_band, yb + 0.7), (x0, yb + 0.7)],
+                                         (x0 + 2 * half_band, yb + 0.75), (x0, yb + 0.75)],
                            color0)
-        # Movement 1: crossing the NS street at y = ±CROSSWALK_MID.
         color1 = WALK_TINT if self._crosswalk_active(1) else PAINT
         for side in (-1, 1):
             y0 = side * CROSSWALK_MID - half_band
-            for xb in np.arange(-ROAD_HALF + 0.4, ROAD_HALF - 0.4, 1.4):
-                _flat_quad(cam, screen, [(xb, y0), (xb + 0.7, y0),
-                                         (xb + 0.7, y0 + 2 * half_band), (xb, y0 + 2 * half_band)],
-                           color1)
+            for xb in np.arange(-ROAD_HALF + 0.5, ROAD_HALF - 0.5, 1.5):
+                _flat_quad(cam, screen, [(xb, y0), (xb + 0.75, y0),
+                                         (xb + 0.75, y0 + 2 * half_band),
+                                         (xb, y0 + 2 * half_band)], color1)
 
-    def _queue_faces(self, a: int, faces: list, overflow_labels: list) -> None:
-        n = len(self.sim.queues[a])
-        if n == 0:
-            return
-        dx, dy = QUEUE_DIR[a]
-        ox, oy = LANE_OFF[a]
-        vertical = dy != 0.0
-        drawn = min(n, MAX_DRAWN[a])
-        for i, (veh_id, _) in enumerate(list(self.sim.queues[a].vehicles)[:drawn]):
-            dist = QUEUE_START + i * CAR_SPACING
-            px, py = dx * dist + ox, dy * dist + oy
-            model, color = _car_style(veh_id)
-            glass = tuple(int(c * 0.45) for c in color)
-            for (along, across), (length, width, height), z0, is_cabin in CAR_MODELS[model]:
-                cx = px + (dx * along if vertical else along if dx > 0 else -along)
-                cy = py + (dy * along if vertical else across)
-                if vertical:
-                    cx += across
-                    size = (width, length, height)
-                else:
-                    size = (length, width, height)
-                box_faces((cx, cy, z0), size, glass if is_cabin else color, self.cam, faces)
-        if n > drawn:
-            dist = QUEUE_START + drawn * CAR_SPACING + 4.0
-            pos, _ = self.cam.project(np.array([[dx * dist + ox, dy * dist + oy, 1.5]]))
-            overflow_labels.append((pos[0], f"+{n - drawn}"))
+    def _draw_lane_arrows(self, screen) -> None:
+        """Painted turn arrows on each lane, just behind the stop line."""
+        cam = self.cam
+        y0 = STOP + 3.2
+        for a in range(4):
+            for turn in "LSR":
+                x = LANE_X[turn]
+                pts = self._arrow_pts(x, y0, turn)
+                _flat_poly(cam, screen, [to_world(a, px, py) for px, py in pts], PAINT)
 
-    # Pole beside each stop line on the approaching driver's side.
+    @staticmethod
+    def _arrow_pts(x: float, y0: float, turn: str) -> list[tuple[float, float]]:
+        # Stem pointing toward the intersection (decreasing y), 2.6 m long.
+        s, hw = 2.2, 0.16
+        head_l, head_w = 1.0, 0.55
+        if turn == "S":
+            return [(x - hw, y0 + s), (x + hw, y0 + s), (x + hw, y0 + head_l),
+                    (x + head_w, y0 + head_l), (x, y0), (x - head_w, y0 + head_l),
+                    (x - hw, y0 + head_l)]
+        d = 1.0 if turn == "L" else -1.0
+        # Stem, then a bend with the head pointing left/right of travel.
+        # Travel is -y; driver's left is +x in this local frame.
+        bend_y = y0 + 0.9
+        tip_x = x + d * 1.25
+        return [
+            (x - hw, y0 + s), (x + hw, y0 + s), (x + hw, bend_y + hw),
+            (x + d * 0.55, bend_y + hw),
+            (x + d * 0.55, bend_y + head_w * 0.9),
+            (tip_x, bend_y - 0.05),
+            (x + d * 0.55, bend_y - head_w),
+            (x + d * 0.55, bend_y - hw) if d > 0 else (x - hw, bend_y - hw),
+            (x - hw, bend_y - hw),
+        ]
+
+    # -------------------------------------------------------------------- cars
+
+    def _visible_cars(self):
+        for car in self.animator.cars.values():
+            if abs(car.pos[0]) < 100 and abs(car.pos[1]) < 100:
+                yield car
+
+    def _draw_car_shadows(self, screen) -> None:
+        cam = self.cam
+        for car in self._visible_cars():
+            model = CAR_MODELS[_car_style(car.veh_id)[0]]
+            length, width = model["foot"]
+            hx, hy = car.heading
+            px, py = car.pos
+            ax, ay = hx * (length / 2 + 0.25), hy * (length / 2 + 0.25)
+            bx, by = -hy * (width / 2 + 0.22), hx * (width / 2 + 0.22)
+            quad = [(px - ax - bx, py - ay - by), (px + ax - bx, py + ay - by),
+                    (px + ax + bx, py + ay + by), (px - ax + bx, py - ay + by)]
+            _flat_quad(cam, screen, quad, ASPHALT_SHADOW, z=0.015)
+
+    def _car_faces(self, batch: BoxBatch) -> None:
+        for car in self._visible_cars():
+            name, color = _car_style(car.veh_id)
+            model = CAR_MODELS[name]
+            glass = tuple(int(c * 0.42) for c in color)
+            hx, hy = car.heading
+            yaw = float(np.arctan2(hy, hx))
+            px, py = car.pos
+            length, width = model["foot"]
+            for (along, across), (bl, bw, bh), z0, kind in model["boxes"]:
+                cx = px + hx * along - hy * across
+                cy = py + hy * along + hx * across
+                batch.add((cx, cy, z0), (bl, bw, bh),
+                          glass if kind == "glass" else color, yaw=yaw)
+            # Wheels at the footprint corners.
+            wx, wy = length / 2 - 0.75, width / 2 - 0.02
+            for sa in (1, -1):
+                for sb in (1, -1):
+                    cx = px + hx * (sa * wx) - hy * (sb * wy)
+                    cy = py + hy * (sa * wx) + hx * (sb * wy)
+                    batch.add((cx, cy, 0.0), (0.72, 0.28, 0.66), TIRE, yaw=yaw)
+            # Head / tail light strips.
+            for sa, lcolor in ((1, HEADLIGHT), (-1, TAILLIGHT)):
+                cx = px + hx * (sa * (length / 2 + 0.02))
+                cy = py + hy * (sa * (length / 2 + 0.02))
+                batch.add((cx, cy, 0.52), (0.10, width * 0.72, 0.16), lcolor, yaw=yaw)
+
+    # ----------------------------------------------------------------- signals
+
+    # Pole beside each stop line on the approaching driver's side (right side).
     POLE_POS = {
-        0: (-ROAD_HALF - 1.5, STOP + 0.8),
-        1: (ROAD_HALF + 1.5, -STOP - 0.8),
-        2: (STOP + 0.8, ROAD_HALF + 1.5),
-        3: (-STOP - 0.8, -ROAD_HALF - 1.5),
+        0: (-ROAD_HALF - 1.7, STOP + 1.0),
+        1: (ROAD_HALF + 1.7, -STOP - 1.0),
+        2: (STOP + 1.0, ROAD_HALF + 1.7),
+        3: (-STOP - 1.0, -ROAD_HALF - 1.7),
     }
 
-    def _signal_pole_faces(self, a: int, faces: list) -> None:
-        px, py = self.POLE_POS[a]
-        box_faces((px, py, 0.0), (0.3, 0.3, 4.4), POLE_COLOR, self.cam, faces)
-        vertical = a in (0, 1)
-        head_size = (1.0, 0.5, 1.9) if vertical else (0.5, 1.0, 1.9)
-        box_faces((px, py, 4.4), head_size, HEAD_COLOR, self.cam, faces)
+    def _has_left_head(self, a: int) -> bool:
+        return self.config.layout.left_turn[a] == LeftTurnTreatment.PROTECTED
 
-    def _signal_color(self, a: int) -> tuple[int, int, int]:
+    def _signal_pole_faces(self, a: int, batch: BoxBatch) -> None:
+        px, py = self.POLE_POS[a]
+        batch.add((px, py, 0.0), (0.32, 0.32, 4.6), POLE_COLOR)
+        vertical = a in (0, 1)
+        head_size = (1.05, 0.55, 2.0) if vertical else (0.55, 1.05, 2.0)
+        batch.add((px, py, 4.6), head_size, HEAD_COLOR)
+        if self._has_left_head(a):
+            # Arrow head hangs beside the main head, toward the road center.
+            ox, oy = self._left_head_offset(a)
+            batch.add((px + ox, py + oy, 4.6), head_size, HEAD_COLOR)
+
+    @staticmethod
+    def _left_head_offset(a: int) -> tuple[float, float]:
+        return {0: (1.25, 0.0), 1: (-1.25, 0.0), 2: (0.0, -1.25), 3: (0.0, 1.25)}[a]
+
+    def _through_color(self, a: int) -> tuple[int, int, int]:
         sig = self.sim.signal
-        # The per-approach head tracks the THROUGH movement; a protected-left
-        # phase shows red here (the left arrow head is not rendered).
         if through_group(a) not in sig.current.movements:
             return RED
         if sig.state == SignalState.GREEN:
@@ -319,28 +574,51 @@ class ViewerApp:
             return AMBER
         return RED
 
+    def _left_color(self, a: int) -> tuple[int, int, int]:
+        sig = self.sim.signal
+        if left_group(a) not in sig.current.movements:
+            return RED
+        if sig.state == SignalState.GREEN:
+            return GREEN_ON
+        if sig.state == SignalState.YELLOW:
+            return AMBER
+        return RED
+
     def _draw_signal_lamps(self, screen) -> None:
-        # Lamps drawn after the sorted faces: heads sit at 4.4-6.3 m, above
-        # every car model, so they are never meaningfully occluded.
         for a in range(4):
             px, py = self.POLE_POS[a]
-            # Lamps sit on the head face toward the approaching driver, which is
-            # the side pointing away from the intersection (the queue direction).
-            fx, fy = QUEUE_DIR[a]
-            color = self._signal_color(a)
-            lit = {RED: 0, AMBER: 1, GREEN_ON: 2}[color]
-            centers = np.array(
-                [[px + fx * 0.27, py + fy * 0.27, 5.85 - slot * 0.62] for slot in range(3)]
-            )
-            scr, depth = self.cam.project(centers)
-            for slot in range(3):
-                r = max(2, int(0.30 * self.cam.focal / depth[slot]))
-                lamp = (RED, AMBER, GREEN_ON)[slot] if slot == lit else LIGHT_OFF
-                pygame.draw.circle(screen, lamp, (int(scr[slot][0]), int(scr[slot][1])), r)
+            fx, fy = to_world(a, 0.0, 1.0)  # toward the approaching driver
+            self._lamp_column(screen, px, py, fx, fy, self._through_color(a))
+            if self._has_left_head(a):
+                ox, oy = self._left_head_offset(a)
+                self._lamp_column(
+                    screen, px + ox, py + oy, fx, fy, self._left_color(a), arrow=True, a=a
+                )
 
-    def _ped_faces(self, faces: list) -> None:
+    def _lamp_column(self, screen, px, py, fx, fy, color, arrow=False, a=0) -> None:
+        lit = {RED: 0, AMBER: 1, GREEN_ON: 2}[color]
+        centers = np.array(
+            [[px + fx * 0.30, py + fy * 0.30, 6.15 - slot * 0.64] for slot in range(3)]
+        )
+        scr, depth = self.cam.project(centers)
+        for slot in range(3):
+            r = max(2, int(0.30 * self.cam.focal / depth[slot]))
+            lamp = (RED, AMBER, GREEN_ON)[slot] if slot == lit else LIGHT_OFF
+            cx, cy = int(scr[slot][0]), int(scr[slot][1])
+            pygame.draw.circle(screen, lamp, (cx, cy), r)
+            if arrow and slot == lit and r >= 3:
+                # Arrow glyph: chevron pointing toward the driver's left.
+                lx, ly = to_world(a, 1.0, 0.0)
+                sx = lx * 0.9
+                pts = [(cx - int(r * 0.7) * (1 if sx >= 0 else -1), cy),
+                       (cx + int(r * 0.5) * (1 if sx >= 0 else -1), cy - int(r * 0.6)),
+                       (cx + int(r * 0.5) * (1 if sx >= 0 else -1), cy + int(r * 0.6))]
+                pygame.draw.polygon(screen, HEAD_COLOR, pts)
+
+    # -------------------------------------------------------- peds and scenery
+
+    def _ped_faces(self, batch: BoxBatch) -> None:
         sig = self.sim.signal
-        # Waiting pedestrians cluster at the corners of their crossing.
         for m in range(2):
             count = min(len(self.sim.waiting_peds[m]), 4)
             for i in range(count):
@@ -348,43 +626,110 @@ class ViewerApp:
                     px, py = CROSSWALK_MID + 0.4 + 0.9 * i, -ROAD_HALF - 1.6
                 else:
                     px, py = ROAD_HALF + 1.6 + 0.9 * i, CROSSWALK_MID + 0.4
-                self._figure(px, py, faces)
-        # Walkers cross during the walk window.
+                self._figure(px, py, batch)
         if sig.walk_active and sig.in_walk_window:
             m = sig.phase
             frac = min(1.0, sig.walk_elapsed / max(sig.timing.walk, 1e-6))
             span = 2 * (ROAD_HALF + 1.2)
             for side in (-1, 1):
                 progress = -ROAD_HALF - 1.2 + frac * span
-                progress *= side  # opposite directions on the two crossings
+                progress *= side
                 if m == 0:
-                    self._figure(side * CROSSWALK_MID, progress, faces)
+                    self._figure(side * CROSSWALK_MID, progress, batch)
                 else:
-                    self._figure(progress, side * CROSSWALK_MID, faces)
+                    self._figure(progress, side * CROSSWALK_MID, batch)
 
-    def _figure(self, px: float, py: float, faces: list) -> None:
-        box_faces((px, py, 0.0), (0.5, 0.5, 1.25), PED_COLOR, self.cam, faces)
-        box_faces((px, py, 1.3), (0.34, 0.34, 0.34), (90, 70, 58), self.cam, faces)
+    def _figure(self, px: float, py: float, batch: BoxBatch) -> None:
+        batch.add((px, py, 0.0), (0.5, 0.5, 1.25), PED_COLOR)
+        batch.add((px, py, 1.3), (0.34, 0.34, 0.34), (90, 70, 58))
+
+    def _scenery_faces(self, batch: BoxBatch) -> None:
+        for i, (tx, ty, s) in enumerate(TREES):
+            fol = FOLIAGE[i % len(FOLIAGE)]
+            batch.add((tx, ty, 0.0), (0.55 * s, 0.55 * s, 2.6 * s), TRUNK)
+            batch.add((tx, ty, 2.4 * s), (3.4 * s, 3.4 * s, 2.4 * s), fol)
+            batch.add((tx, ty, 4.6 * s), (2.2 * s, 2.2 * s, 1.7 * s), fol)
+        for (bx, by), (bl, bw, bh), color in BUILDINGS:
+            batch.add((bx, by, 0.0), (bl, bw, bh), color)
+            batch.add((bx, by, bh), (bl * 0.94, bw * 0.94, 0.5),
+                      tuple(int(c * 0.8) for c in color))
+
+    def _draw_timing_labels(self, screen, font) -> None:
+        """Floating card above each pole: green time per phase this light
+        serves (planned for fixed plans, measured last green otherwise), with
+        the active phase counting up live."""
+        sig = self.sim.signal
+        phases = self.config.phases
+        for a in range(4):
+            thru_slot, left_slot = (1, 0) if a in (0, 1) else (3, 2)
+            entries = []
+            for tag, slot in (("L", left_slot), ("T", thru_slot)):
+                idx = next((i for i, p in enumerate(phases) if p.slot == slot), None)
+                if idx is None:
+                    continue
+                green = self._phase_green.get(idx)
+                base = f"{green:.0f}s" if green is not None else "--"
+                if sig.phase == idx and sig.state == SignalState.GREEN:
+                    entries.append((f"{tag} {sig.state_elapsed:.0f}/{base}", GREEN_ON))
+                elif sig.phase == idx and sig.state == SignalState.YELLOW:
+                    entries.append((f"{tag} {base}", AMBER))
+                else:
+                    entries.append((f"{tag} {base}", HUD_DIM))
+            if not entries:
+                continue
+            px, py = self.POLE_POS[a]
+            pos, _ = self.cam.project(np.array([[px, py, 7.4]]))
+            surfs = [font.render(text, True, color) for text, color in entries]
+            w = max(s.get_width() for s in surfs) + 10
+            h = sum(s.get_height() for s in surfs) + 8
+            panel = pygame.Surface((w, h), pygame.SRCALPHA)
+            panel.fill((10, 10, 10, 165))
+            y = 4
+            for s in surfs:
+                panel.blit(s, (5, y))
+                y += s.get_height()
+            screen.blit(panel, panel.get_rect(midbottom=(int(pos[0][0]), int(pos[0][1]))))
+
+    def _draw_overflow_labels(self, screen, font) -> None:
+        for a, extra in self.animator.overflow(self.sim).items():
+            pos, _ = self.cam.project(
+                np.array([[*to_world(a, LANE_X["S"], 88.0), 2.0]])
+            )
+            label = font.render(f"+{extra}", True, HUD_INK)
+            screen.blit(label, label.get_rect(center=(int(pos[0][0]), int(pos[0][1]))))
+
+    # --------------------------------------------------------------------- HUD
 
     def _draw_hud(self, screen, font) -> None:
         sig = self.sim.signal
-        # Per-approach totals: through group + left bay.
         q = [
             len(self.sim.queues[through_group(a)]) + len(self.sim.queues[left_group(a)])
             for a in range(4)
         ]
+        title = (
+            f"rl-online (learning)  ·  {self.scenario}  ·  seed {self.seed}"
+            if self.learner
+            else f"{self.controller_name}  ·  {self.scenario}  ·  seed {self.seed}"
+        )
         lines = [
-            f"{self.controller_name}  ·  {self.scenario}  ·  seed {self.seed}",
+            title,
             f"t = {self.sim.t:7.0f} s   speed {self.speed:.0f}x"
             + ("   PAUSED" if self.paused else ""),
             f"phase {sig.current.name} {sig.state.name}"
             f"  ({sig.state_elapsed:.0f} s in state)",
             f"queues  N {q[0]:>3}  S {q[1]:>3}  E {q[2]:>3}  W {q[3]:>3}",
-            f"mean wait so far: {self._mean_wait:5.1f} s   departed: {self._n_departed_done()}",
-            "Space pause · +/- speed · R reset · Esc quit",
+            f"mean wait: last hour {self._rolling_wait:5.1f} s"
+            f" · overall {self._mean_wait:5.1f} s · departed {self._n_departed_done()}",
         ]
+        if self.learner:
+            lr = self.learner
+            lines.append(
+                f"learning  eps {lr.epsilon:.2f}  steps {lr.steps:,}"
+                f"  updates {lr.updates:,}  reward ema {lr.reward_ema:6.3f}"
+            )
+        lines.append("Space pause · +/- speed · R reset · Esc quit")
         pad, lh = 12, 22
-        panel = pygame.Surface((440, pad * 2 + lh * len(lines)), pygame.SRCALPHA)
+        panel = pygame.Surface((520, pad * 2 + lh * len(lines)), pygame.SRCALPHA)
         panel.fill((10, 10, 10, 175))
         screen.blit(panel, (10, 10))
         for i, line in enumerate(lines):
@@ -396,7 +741,7 @@ class ViewerApp:
 
     # ------------------------------------------------------------------ loop
 
-    def run(self, smoke_frames: int | None = None) -> None:
+    def run(self, smoke_frames: int | None = None, screenshot: str | None = None) -> None:
         pygame.init()
         screen = pygame.display.set_mode((W, H))
         pygame.display.set_caption("traffic-rl")
@@ -428,6 +773,11 @@ class ViewerApp:
             frames += 1
             if smoke_frames is not None and frames >= smoke_frames:
                 running = False
+        if screenshot:
+            pygame.image.save(screen, screenshot)
+        if self.learner and self.learner.steps > 0:
+            self.learner.save(self.learn_out)
+            print(f"saved online-learned weights -> {self.learn_out}")
         pygame.quit()
 
 
@@ -441,11 +791,33 @@ def main() -> None:
         "--smoke", type=int, default=None, metavar="FRAMES",
         help="render N frames on a dummy display and exit (CI/verification)",
     )
+    parser.add_argument(
+        "--screenshot", type=str, default=None, metavar="PATH",
+        help="save the final frame as a PNG (useful with --smoke)",
+    )
+    parser.add_argument(
+        "--learn", action="store_true",
+        help="online learning: the RL policy keeps training while you watch "
+        "(warm-started from the shipped weights; ignores --controller)",
+    )
+    parser.add_argument(
+        "--learn-fresh", action="store_true",
+        help="with --learn: start from random weights instead of the shipped policy",
+    )
+    parser.add_argument(
+        "--learn-out", type=str, default=None, metavar="PATH",
+        help="with --learn: where to save the learned weights "
+        "(default results/online_weights.npz; autosaves every 100k steps and on exit)",
+    )
     args = parser.parse_args()
     if args.smoke is not None:
         os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
-    app = ViewerApp(args.controller, args.scenario, args.speed, args.seed)
-    app.run(smoke_frames=args.smoke)
+    app = ViewerApp(
+        args.controller, args.scenario, args.speed, args.seed,
+        learn=args.learn or args.learn_fresh, learn_fresh=args.learn_fresh,
+        learn_out=args.learn_out,
+    )
+    app.run(smoke_frames=args.smoke, screenshot=args.screenshot)
     if args.smoke is not None:
         print(f"smoke ok: {args.smoke} frames, sim t = {app.sim.t:.0f} s")
 

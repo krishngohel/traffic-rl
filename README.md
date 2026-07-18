@@ -68,10 +68,20 @@ used and the report says so. The study you get back:
   max-pressure, and the learned policy — because "what would detection
   hardware buy instead?" is the question a screening study should answer.
 
+**The study starts where the street starts.** The baseline is the
+intersection's *current* timings: pass `--current-greens` to use the installed
+plan, or the tool derives a practice-typical plan from your data (cycle from
+the FHWA Signal Timing Manual's 60–120 s practice range, splits proportional
+to peak counts). That baseline's wait times are measured first — with an HCM
+LOS grade — and every projection is improvement over it; the current plan also
+seeds the search and enters the final tournament, so the recommendation can
+never lose to what is already installed (when it can't win, the report says
+"no retiming warranted" — the honest screening outcome).
+
 On the bundled legacy example (`examples/counts_example.csv`, a 5-hour AM
-profile) the recommended plans cut p95 wait **57%** vs a naive 50/50 signal
-(43.4 s vs 101.5 s); actuated reaches 34.1 s and the learned policy 36.5 s —
-on a demand profile neither ever saw.
+profile) the practice baseline sits at p95 44.2 s (mean 16.5 s, LOS B); the
+recommended plans reach 42.3 s, a naive 50/50 signal 101.5 s, actuated 34.1 s
+and the learned policy 36.5 s — on a demand profile neither ever saw.
 
 **Sample lights**: `examples/sites/` bundles two ready-to-run intersections
 with full TMC profiles and geometry — a 45 mph suburban arterial whose NS
@@ -255,6 +265,21 @@ traffic-rl-watch --controller actuated --scenario arterial_lefts --speed 8
 The viewer (`pygame-ce`) shows live queues, signal heads, and pedestrian walk
 phases at 1x–1024x. Keys: `Space` pause · `+`/`-` speed · `R` new seed · `Esc`
 quit.
+
+`traffic-rl-watch --learn` runs the policy in **online-learning mode**: the
+DQN keeps training on the live stream of transitions while you watch
+(warm-started from the shipped weights; `--learn-fresh` starts from scratch).
+The HUD shows epsilon, update count, and a rolling last-hour mean wait so you
+can see it improve. Exploration is safe by construction — the signal state
+machine enforces clearance intervals and the anti-starvation backstop no
+matter what the learner requests. Weights autosave to
+`results/online_weights.npz` (every 100k steps and on exit); evaluate them
+with `RLController(weights="results/online_weights.npz")`.
+
+Every seeded run is independent, so `traffic-rl-eval`, `traffic-rl-eval-network`,
+and `traffic-rl-optimize` distribute runs across all CPU cores by default —
+results are bit-identical to a serial run, just 10–20x faster on a desktop.
+Pass `--jobs 1` to force serial execution (or `--jobs N` to cap workers).
 
 Train your own policies: `traffic-rl-train` (standard DQN, minutes on a
 laptop, deterministic per seed), `traffic-rl-train --pattern` (the pattern
