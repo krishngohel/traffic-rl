@@ -43,15 +43,70 @@ from traffic_rl.config import (
     timing_from_geometry,
 )
 from traffic_rl.controllers import CONTROLLER_REGISTRY
-from traffic_rl.controllers.fixed_time import (
-    FixedTimeController,
-    FixedTimePlan,
-    ScheduledFixedTimeController,
-)
+from traffic_rl.controllers.fixed_time import FixedTimePlan
 from traffic_rl.controllers.webster import phase_floors, webster_plan
 from traffic_rl.data import DEFAULT_SITE, SiteConfig, left_turn_warrant, load_counts_csv
-from traffic_rl.eval.harness import run_controller, run_seeds
+from traffic_rl.eval.harness import run_seeds
 from traffic_rl.eval.metrics import mean_ci, paired_diff_ci
+from traffic_rl.eval.parallel import RunPool, run_single_task
+
+# ---------------------------------------------------------------- real-world anchors
+# Encoded from published practice so a study with no --current-greens still
+# starts from what an agency most plausibly has installed today:
+# - FHWA Traffic Signal Timing Manual (FHWA-HOP-08-024, ch. 5): pretimed cycle
+#   lengths in practice typically run 60-120 s (longer only on congested
+#   arterials); NACTO urban guidance favors 60-90 s for walkable streets.
+# - HCM 6th ed. signalized-intersection LOS bands by control delay (s/veh):
+#   A <=10, B <=20, C <=35, D <=55, E <=80, F >80.
+PRACTICE_CYCLES = (60.0, 90.0, 120.0)  # light / moderate / heavy demand
+_HCM_LOS_BANDS = (("A", 10.0), ("B", 20.0), ("C", 35.0), ("D", 55.0), ("E", 80.0))
+
+
+def hcm_los(control_delay_s: float) -> str:
+    """HCM 6th ed. signalized LOS grade for a mean control delay (s/veh)."""
+    for grade, hi in _HCM_LOS_BANDS:
+        if control_delay_s <= hi:
+            return grade
+    return "F"
+
+
+def practice_baseline_plan(
+    schedule: DemandSchedule, config: SimConfig
+) -> tuple[FixedTimePlan, str]:
+    """The timings a signal shop most plausibly has installed today, built the
+    way practitioners do it: pick a practice-typical cycle (60/90/120 s by
+    peak-period demand, per the FHWA STM range), split green proportional to
+    each phase's critical peak volume, respect ped/min-green floors, round to
+    whole seconds. This is the study's starting point and headline baseline
+    whenever the agency's actual --current-greens are not supplied."""
+    phases, timing = config.phases, config.timing
+    peak = max((d for _, d in schedule), key=lambda d: sum(d.vehicle_rates))
+    flows = _movement_flows(peak, config.layout)
+    sat = _group_sat(config)
+    y = np.array(
+        [
+            max((flows[g] / sat[g] for g in p.movements), default=0.0)
+            for p in phases
+        ]
+    )
+    y = np.maximum(y, 1e-6)
+    y_total = float(y.sum())
+    cycle = PRACTICE_CYCLES[0 if y_total < 0.55 else (1 if y_total < 0.80 else 2)]
+    clearance = sum(timing.yellow_for(p) + timing.all_red_for(p) for p in phases)
+    avail = max(cycle - clearance - timing.startup_lost * len(phases), 8.0 * len(phases))
+    floors = phase_floors(phases, timing)
+    greens = tuple(
+        float(round(max(avail * yi / y_total + timing.startup_lost, f)))
+        for yi, f in zip(y, floors, strict=True)
+    )
+    plan = FixedTimePlan(greens=greens)
+    note = (
+        f"assumed typical practice: {cycle:.0f} s cycle (FHWA STM 60-120 s range), "
+        "green splits proportional to peak-period counts — pass --current-greens "
+        "to use the intersection's actual installed timings"
+    )
+    return plan, note
+
 
 CYCLE_SCALES = (0.75, 1.0, 1.25)
 SPLIT_SHIFTS = (-0.08, 0.0, 0.08)
@@ -100,10 +155,16 @@ def _through_phase_indices(phases: tuple[Phase, ...]) -> tuple[int, int]:
     return ns, ew
 
 
-def _candidate_plans(demand: DemandConfig, config: SimConfig) -> list[FixedTimePlan]:
+def _candidate_plans(
+    demand: DemandConfig,
+    config: SimConfig,
+    seed_plans: tuple[FixedTimePlan, ...] = (),
+) -> list[FixedTimePlan]:
     """Webster base plan, then a local search: cycle scales x shifting
     effective green between the two THROUGH phases (left splits stay
-    Webster-proportional, floored)."""
+    Webster-proportional, floored). seed_plans (e.g. the intersection's
+    current timings) enter the tournament unchanged, so the search starts
+    from — and can never do worse than — the installed plan."""
     timing = config.timing
     phases = config.phases
     floors = phase_floors(phases, timing)
@@ -154,11 +215,17 @@ def _candidate_plans(demand: DemandConfig, config: SimConfig) -> list[FixedTimeP
         if greens not in seen:
             seen.add(greens)
             plans.append(FixedTimePlan(greens=greens))
+    for plan in seed_plans:
+        if len(plan.greens) == len(phases) and plan.greens not in seen:
+            seen.add(plan.greens)
+            plans.append(plan)
     return plans
 
 
 def optimize_interval(
-    demand: DemandConfig, base_config: SimConfig, seeds: list[int]
+    demand: DemandConfig, base_config: SimConfig, seeds: list[int],
+    pool: RunPool | None = None,
+    seed_plans: tuple[FixedTimePlan, ...] = (),
 ) -> tuple[FixedTimePlan, float]:
     """Best fixed-time plan for one interval's demand: (plan, mean per-run p95)."""
     from dataclasses import replace
@@ -166,13 +233,14 @@ def optimize_interval(
     config = replace(
         base_config, demand=demand, demand_schedule=None, warmup=600.0, measured=1800.0
     )
+    plans = _candidate_plans(demand, config, seed_plans=seed_plans)
+    pool = pool or RunPool(1)
+    tasks = [(("fixed", plan), config, seed) for plan in plans for seed in seeds]
+    flat = pool.map(run_single_task, tasks)
     best_plan, best_score = None, np.inf
-    for plan in _candidate_plans(demand, config):
-        p95s = [
-            run_controller(FixedTimeController(plan), config, seed)["p95_wait"]
-            for seed in seeds
-        ]
-        score = float(np.mean(p95s))
+    for i, plan in enumerate(plans):
+        runs = flat[i * len(seeds) : (i + 1) * len(seeds)]
+        score = float(np.mean([r["p95_wait"] for r in runs]))
         if score < best_score:
             best_plan, best_score = plan, score
     return best_plan, best_score
@@ -197,10 +265,14 @@ def _full_profile_tournament(
     tod_plans: list[tuple[float, FixedTimePlan]],
     config: SimConfig,
     seeds: list[int],
+    pool: RunPool | None = None,
+    current_plan: FixedTimePlan | None = None,
 ) -> list[tuple[float, FixedTimePlan]]:
     """Pick the best whole-day schedule by paired sims on the full profile.
     Contestants: the per-interval refine winners, variants with scaled left
-    greens (carryover protection for the peak), and flat equal splits."""
+    greens (carryover protection for the peak), flat equal splits, and the
+    intersection's current timings (the recommendation can then never lose
+    to the plan already installed)."""
     floors = phase_floors(config.phases, config.timing)
     equal = FixedTimePlan(
         greens=tuple(round(max(25.0, f), 1) for f in floors)
@@ -215,11 +287,19 @@ def _full_profile_tournament(
         ],
         "equal splits": [(0.0, equal)],
     }
+    if current_plan is not None:
+        contestants["current timings"] = [(0.0, current_plan)]
+    pool = pool or RunPool(1)
+    tasks = [
+        (("scheduled", schedule_plans), config, s)
+        for schedule_plans in contestants.values()
+        for s in seeds
+    ]
+    flat = pool.map(run_single_task, tasks)
     best_name, best_schedule, best_score = None, None, np.inf
-    for name, schedule_plans in contestants.items():
-        controller = ScheduledFixedTimeController(schedule_plans)
-        p95s = [run_controller(controller, config, s)["p95_wait"] for s in seeds]
-        score = float(np.mean(p95s))
+    for i, (name, schedule_plans) in enumerate(contestants.items()):
+        runs = flat[i * len(seeds) : (i + 1) * len(seeds)]
+        score = float(np.mean([r["p95_wait"] for r in runs]))
         if score < best_score:
             best_name, best_schedule, best_score = name, schedule_plans, score
     print(f"  full-profile tournament -> {best_name} (p95 {best_score:.1f} s)")
@@ -292,6 +372,7 @@ def optimize_from_counts(
     train_site_steps: int = 0,
     site: SiteConfig | None = None,
     site_from_file: bool = False,
+    jobs: int | None = None,
 ) -> dict:
     schedule, duration, has_tmc = load_counts_csv(csv_path)
     if duration < MIN_EVAL_SECONDS + 900.0:
@@ -314,6 +395,7 @@ def optimize_from_counts(
     )
     phases = base_config.phases
     refine_seeds = run_seeds(seed + 1, REFINE_RUNS)
+    pool = RunPool(jobs)
 
     treatments = ", ".join(
         f"{name}={layout.left_turn[a].name.lower()}"
@@ -326,9 +408,33 @@ def optimize_from_counts(
     for note in warrant_notes:
         print(f"  protected-left warrant met — {note}")
 
+    # The study starts from the CURRENT timings: the agency's installed plan
+    # when supplied, otherwise a practice-typical plan derived from this data
+    # (FHWA STM cycle range, splits proportional to peak counts). Its wait
+    # times are measured first — everything after is improvement over that.
+    if current_plan is not None:
+        baseline_source = "user-provided current timings"
+    else:
+        current_plan, note = practice_baseline_plan(schedule, base_config)
+        baseline_source = "assumed typical practice (no --current-greens)"
+        print(f"  {note}")
+    seeds = run_seeds(seed, runs)
+    baseline_runs = pool.map(
+        run_single_task, [(("fixed", current_plan), base_config, s) for s in seeds]
+    )
+    base_mean = float(np.mean([r["mean_wait"] for r in baseline_runs]))
+    base_p95 = float(np.mean([r["p95_wait"] for r in baseline_runs]))
+    print(
+        f"  current timings baseline: cycle {current_plan.cycle_for(base_config):.1f} s"
+        f"  greens {current_plan.greens}  ->  mean wait {base_mean:.1f} s"
+        f" (HCM LOS {hcm_los(base_mean)}), p95 {base_p95:.1f} s — the plan to beat"
+    )
+
     tod_plans: list[tuple[float, FixedTimePlan]] = []
     for start, demand in schedule:
-        plan, score = optimize_interval(demand, base_config, refine_seeds)
+        plan, score = optimize_interval(
+            demand, base_config, refine_seeds, pool=pool, seed_plans=(current_plan,)
+        )
         tod_plans.append((start, plan))
         flows = tuple(round(v) for v in demand.vehicle_rates)
         print(
@@ -342,35 +448,36 @@ def optimize_from_counts(
     # few systematic variants fight a final tournament on the FULL profile
     # (fresh seeds — the report's evaluation seeds stay untouched).
     tod_plans = _full_profile_tournament(
-        tod_plans, base_config, run_seeds(seed + 2, REFINE_RUNS)
+        tod_plans, base_config, run_seeds(seed + 2, REFINE_RUNS), pool=pool,
+        current_plan=current_plan,
     )
 
     # Full-profile comparison, identical rules for every contender.
     config = base_config
-    seeds = run_seeds(seed, runs)
     avg_flows = _average_demand(schedule, duration)
-    contenders: dict[str, object] = {
-        "optimized_tod": ScheduledFixedTimeController(tod_plans),
-        "naive_equal_split": CONTROLLER_REGISTRY["naive"](),
-        "webster_avg_flows": FixedTimeController(
+    contenders: dict[str, tuple] = {
+        "current_plan": ("fixed", current_plan),
+        "optimized_tod": ("scheduled", tod_plans),
+        "naive_equal_split": ("registry", "naive"),
+        "webster_avg_flows": (
+            "fixed",
             webster_plan(
                 _movement_flows(avg_flows, layout), _group_sat(config), timing, phases,
                 green_floors=phase_floors(phases, timing),
-            )
+            ),
         ),
-        "actuated": CONTROLLER_REGISTRY["actuated"](),
-        "max_pressure": CONTROLLER_REGISTRY["max_pressure"](),
+        "actuated": ("registry", "actuated"),
+        "max_pressure": ("registry", "max_pressure"),
     }
-    if current_plan is not None:
-        contenders["current_plan"] = FixedTimeController(current_plan)
     if include_rl:
         for name in ("rl", "rl_pattern"):
             try:
-                contenders[name] = CONTROLLER_REGISTRY[name]()
+                CONTROLLER_REGISTRY[name]()  # probe: weights must exist on disk
+                contenders[name] = ("registry", name)
             except FileNotFoundError:
                 print(f"(no trained {name} weights found — skipping)")
     if train_site_steps > 0:
-        from traffic_rl.rl.pattern_policy import PATTERN_WEIGHTS, PatternRLController
+        from traffic_rl.rl.pattern_policy import PATTERN_WEIGHTS
         from traffic_rl.rl.train import train_pattern_policy
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -382,26 +489,38 @@ def optimize_from_counts(
             log_prefix="  [site] ",
             init_weights=PATTERN_WEIGHTS if PATTERN_WEIGHTS.exists() else None,
         )
-        contenders["rl_site_trained"] = PatternRLController(weights=site_weights)
+        contenders["rl_site_trained"] = ("pattern_weights", site_weights)
 
+    # current_plan was already measured up front (same seeds) — reuse those runs.
+    todo = [name for name in contenders if name != "current_plan"]
+    tasks = [(contenders[name], config, s) for name in todo for s in seeds]
+    flat = pool.map(run_single_task, tasks)
+    pool.close()
+    per_name = {"current_plan": baseline_runs} | {
+        name: flat[i * len(seeds) : (i + 1) * len(seeds)] for i, name in enumerate(todo)
+    }
     results: dict[str, dict] = {}
-    for name, controller in contenders.items():
-        runs_out = [run_controller(controller, config, s) for s in seeds]
+    for name in contenders:
+        runs_out = per_name[name]
+        mean_wait = mean_ci(np.array([r["mean_wait"] for r in runs_out]))
         results[name] = {
             "p95": mean_ci(np.array([r["p95_wait"] for r in runs_out])),
-            "mean": mean_ci(np.array([r["mean_wait"] for r in runs_out])),
+            "mean": mean_wait,
             "ped_p95": mean_ci(np.array([r["ped_p95_wait"] for r in runs_out])),
             "p95_runs": [r["p95_wait"] for r in runs_out],
             "n_unstable": int(sum(r["unstable"] for r in runs_out)),
+            "hcm_los": hcm_los(mean_wait["mean"]),
         }
         print(
             f"  {name:<18} p95 {results[name]['p95']['mean']:6.1f} s "
             f"(CI {results[name]['p95']['lo']:.1f}-{results[name]['p95']['hi']:.1f})"
+            f"  mean {mean_wait['mean']:5.1f} s  LOS {results[name]['hcm_los']}"
         )
 
     report = _build_report(
         csv_path, config, tod_plans, results, runs,
         has_tmc=has_tmc, warrant_notes=warrant_notes, site_from_file=site_from_file,
+        baseline_source=baseline_source, current_plan=current_plan,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(out_dir / "report.json", "w", encoding="utf-8") as f:
@@ -419,6 +538,8 @@ def _build_report(
     csv_path, config: SimConfig, tod_plans, results, runs,
     has_tmc: bool = False, warrant_notes: list[str] | None = None,
     site_from_file: bool = False,
+    baseline_source: str = "user-provided current timings",
+    current_plan: FixedTimePlan | None = None,
 ) -> dict:
     timing = config.timing
     phases = config.phases
@@ -431,6 +552,26 @@ def _build_report(
         "source": str(csv_path),
         "n_runs": runs,
         "baseline": baseline_key,
+        "baseline_source": baseline_source,
+        "baseline_plan": {
+            "cycle_s": round(current_plan.cycle_for(config), 1),
+            "greens_s": {
+                p.name: g for p, g in zip(phases, current_plan.greens, strict=True)
+            },
+        }
+        if current_plan is not None
+        else None,
+        "real_world_context": {
+            "practice_cycle_range_s": "60-120 (FHWA Traffic Signal Timing Manual, "
+            "FHWA-HOP-08-024 ch. 5; NACTO urban guidance favors 60-90)",
+            "hcm_los_bands_s_per_veh": {
+                "A": "<=10", "B": "<=20", "C": "<=35",
+                "D": "<=55", "E": "<=80", "F": ">80",
+            },
+            "note": "Simulated queue wait approximates HCM control delay from "
+            "below (it excludes deceleration/acceleration time); LOS grades "
+            "shown are therefore slightly optimistic.",
+        },
         "has_turning_movements": has_tmc,
         "geometry_assumed_defaults": has_tmc and not site_from_file,
         "phasing": {
@@ -470,6 +611,7 @@ def _build_report(
                 "mean_wait_s": {k: round(v, 2) for k, v in r["mean"].items()},
                 "ped_p95_wait_s": {k: round(v, 2) for k, v in r["ped_p95"].items()},
                 "n_unstable": r["n_unstable"],
+                "hcm_los": r.get("hcm_los", hcm_los(r["mean"]["mean"])),
             }
             for name, r in results.items()
         },
@@ -528,6 +670,22 @@ def _render_markdown(report: dict) -> str:
                 "surveyed values before implementation.*",
                 "",
             ]
+    base = report.get("baseline_plan")
+    if base is not None:
+        greens = ", ".join(f"{n} {g:.0f} s" for n, g in base["greens_s"].items())
+        base_stats = report["comparison"][report["baseline"]]
+        lines += [
+            "## Starting point: current timings",
+            "",
+            f"Baseline: **{report.get('baseline_source', 'current timings')}** — "
+            f"cycle {base['cycle_s']} s ({greens}).",
+            "",
+            f"Measured on this data before any optimization: mean wait "
+            f"**{base_stats['mean_wait_s']['mean']} s/veh (HCM LOS "
+            f"{base_stats['hcm_los']})**, p95 {base_stats['p95_wait_s']['mean']} s. "
+            "Every projection below is improvement over this plan.",
+            "",
+        ]
     lines += [
         "## Recommended time-of-day plans",
         "",
@@ -552,17 +710,26 @@ def _render_markdown(report: dict) -> str:
         "",
         "## Full comparison (p95 wait, mean of paired runs, 95% CI)",
         "",
-        "| controller | p95 wait (s) | mean wait (s) | ped p95 (s) | unstable runs |",
-        "|---|---|---|---|---|",
+        "| controller | p95 wait (s) | mean wait (s) | LOS | ped p95 (s) | unstable runs |",
+        "|---|---|---|---|---|---|",
     ]
     ordered = sorted(report["comparison"].items(), key=lambda kv: kv[1]["p95_wait_s"]["mean"])
     for name, r in ordered:
         lines.append(
             f"| {name} | {r['p95_wait_s']['mean']} "
             f"[{r['p95_wait_s']['lo']}, {r['p95_wait_s']['hi']}] "
-            f"| {r['mean_wait_s']['mean']} | {r['ped_p95_wait_s']['mean']} "
+            f"| {r['mean_wait_s']['mean']} | {r.get('hcm_los', '-')} "
+            f"| {r['ped_p95_wait_s']['mean']} "
             f"| {r['n_unstable']}/{report['n_runs']} |"
         )
+    ctx = report.get("real_world_context")
+    if ctx:
+        lines += [
+            "",
+            "*LOS grades use the HCM 6th-ed. signalized control-delay bands "
+            "(A ≤10, B ≤20, C ≤35, D ≤55, E ≤80, F >80 s/veh). Typical installed "
+            f"cycle lengths run {ctx['practice_cycle_range_s']}. {ctx['note']}*",
+        ]
     model_limits = (
         "point-queue, no RTOR, no protected+permissive (FYA) phasing, bay storage "
         "not capacity-limited"
@@ -667,10 +834,33 @@ def _corridor_candidates(node_flows, timing, link_travel: float, n_nodes: int):
     return candidates
 
 
-def optimize_corridor_interval(node_demands, timing, link_travel, seeds):
+def corridor_practice_baseline(schedules, timing, n_nodes: int):
+    """What the corridor most plausibly runs today: each signal on the
+    practice-typical cycle for its peak demand (FHWA STM 60-120 s range, common
+    cycle = the corridor max), splits proportional to peak counts, simultaneous
+    offsets (i.e. nominally coordinated but never retimed)."""
+    from traffic_rl.controllers.network import CoordinatedPlan, _plan_for_cycle
+
+    peak_flows = []
+    for i in range(n_nodes):
+        peak = max((d for _, d in schedules[i]), key=lambda d: sum(d.vehicle_rates))
+        peak_flows.append(np.concatenate([np.asarray(peak.vehicle_rates, float), np.zeros(4)]))
+    y = max(
+        (max(f[0], f[1]) + max(f[2], f[3])) / 1800.0 for f in peak_flows
+    )
+    cycle = PRACTICE_CYCLES[0 if y < 0.55 else (1 if y < 0.80 else 2)]
+    node_plans = tuple(_plan_for_cycle(f, float(cycle), timing) for f in peak_flows)
+    return CoordinatedPlan(
+        node_plans=node_plans,
+        offsets=tuple(0.0 for _ in range(n_nodes)),
+        scheme="simultaneous",
+    ), cycle
+
+
+def optimize_corridor_interval(node_demands, timing, link_travel, seeds,
+                               pool: RunPool | None = None):
     """Best coordinated plan for one interval: (plan, mean per-run journey p95)."""
-    from traffic_rl.controllers.network import ScheduledCoordinatedController
-    from traffic_rl.eval.network_harness import run_network_controller
+    from traffic_rl.eval.parallel import run_network_task
     from traffic_rl.sim.network import NetworkConfig
 
     n_nodes = len(node_demands)
@@ -679,13 +869,18 @@ def optimize_corridor_interval(node_demands, timing, link_travel, seeds):
         timing=timing, warmup=CORRIDOR_REFINE_WARMUP, measured=CORRIDOR_REFINE_MEASURED,
     )
     node_flows = [d.vehicle_rates for d in node_demands]
+    candidates = _corridor_candidates(node_flows, timing, link_travel, n_nodes)
+    pool = pool or RunPool(1)
+    tasks = [
+        (("coordinated", [(0.0, plan)]), config, seed)
+        for plan in candidates
+        for seed in seeds
+    ]
+    flat = pool.map(run_network_task, tasks)
     best_plan, best_score = None, np.inf
-    for plan in _corridor_candidates(node_flows, timing, link_travel, n_nodes):
-        controller = ScheduledCoordinatedController([(0.0, plan)])
-        p95s = [
-            run_network_controller(controller, config, seed)["p95_wait"] for seed in seeds
-        ]
-        score = float(np.mean(p95s))
+    for i, plan in enumerate(candidates):
+        runs = flat[i * len(seeds) : (i + 1) * len(seeds)]
+        score = float(np.mean([r["p95_wait"] for r in runs]))
         if score < best_score:
             best_plan, best_score = plan, score
     return best_plan, best_score
@@ -698,13 +893,11 @@ def optimize_corridor_from_counts(
     out_dir: Path = Path("results") / "optimize",
     link_travel: float = 20.0,
     include_rl: bool = True,
+    jobs: int | None = None,
 ) -> dict:
-    from traffic_rl.controllers.network import ScheduledCoordinatedController
     from traffic_rl.data import load_corridor_counts_csv
-    from traffic_rl.eval.network_harness import (
-        network_controller_registry,
-        run_network_controller,
-    )
+    from traffic_rl.eval.network_harness import network_controller_registry
+    from traffic_rl.eval.parallel import run_network_task
     from traffic_rl.sim.network import NetworkConfig
 
     schedules, duration, n_nodes = load_corridor_counts_csv(csv_path)
@@ -715,17 +908,26 @@ def optimize_corridor_from_counts(
         )
     timing = SignalTimingConfig()
     refine_seeds = run_seeds(seed + 1, CORRIDOR_REFINE_RUNS)
+    pool = RunPool(jobs)
     print(
         f"loaded {csv_path}: corridor of {n_nodes} intersections, "
         f"{len(schedules[0])} intervals, {duration / 3600:.1f} h, "
         f"link travel {link_travel:.0f} s"
     )
 
+    # Start from what the corridor plausibly runs today: practice-typical
+    # common cycle, proportional splits, simultaneous (unretimed) offsets.
+    practice_plan, practice_cycle = corridor_practice_baseline(schedules, timing, n_nodes)
+    print(
+        f"  current-practice baseline: common cycle {practice_cycle:.0f} s "
+        "(FHWA STM range), simultaneous offsets — the corridor to beat"
+    )
+
     tod_plans = []
     for k, (start, _) in enumerate(schedules[0]):
         node_demands = [schedules[i][k][1] for i in range(n_nodes)]
         plan, score = optimize_corridor_interval(node_demands, timing, link_travel,
-                                                 refine_seeds)
+                                                 refine_seeds, pool=pool)
         tod_plans.append((start, plan))
         greens = "; ".join(f"{p.greens[0]:.0f}/{p.greens[1]:.0f}" for p in plan.node_plans)
         print(
@@ -743,24 +945,58 @@ def optimize_corridor_from_counts(
         warmup=900.0,
         measured=duration - 900.0,
     )
+
+    # The recommendation must never lose to the plan already in the street:
+    # full-profile playoff between the assembled TOD schedule and the current
+    # practice plan (fresh seeds — the report's evaluation seeds stay untouched).
+    check_seeds = run_seeds(seed + 2, CORRIDOR_REFINE_RUNS)
+    playoff = {"optimized_tod": tod_plans, "current_practice": [(0.0, practice_plan)]}
+    tasks = [
+        (("coordinated", schedule_plans), config, s)
+        for schedule_plans in playoff.values()
+        for s in check_seeds
+    ]
+    flat = pool.map(run_network_task, tasks)
+    scores = {}
+    for i, name in enumerate(playoff):
+        chunk = flat[i * len(check_seeds) : (i + 1) * len(check_seeds)]
+        scores[name] = float(np.mean([r["p95_wait"] for r in chunk]))
+    if scores["current_practice"] < scores["optimized_tod"]:
+        print(
+            f"  full-profile playoff: current practice wins "
+            f"({scores['current_practice']:.1f} s vs {scores['optimized_tod']:.1f} s) "
+            "— no retiming recommended; the searched schedules do not beat it"
+        )
+        tod_plans = [(0.0, practice_plan)]
+    else:
+        print(
+            f"  full-profile playoff: optimized schedule wins "
+            f"({scores['optimized_tod']:.1f} s vs {scores['current_practice']:.1f} s)"
+        )
+
     seeds = run_seeds(seed, runs)
     registry = network_controller_registry()
-    contenders: dict[str, object] = {
-        "optimized_tod_coordinated": ScheduledCoordinatedController(tod_plans),
-        "naive_uncoordinated": registry["naive"](),
-        "greenwave_observed": registry["greenwave"](),
-        "actuated": registry["actuated"](),
-        "max_pressure": registry["max_pressure"](),
+    contenders: dict[str, tuple] = {
+        "current_practice": ("coordinated", [(0.0, practice_plan)]),
+        "optimized_tod_coordinated": ("coordinated", tod_plans),
+        "naive_uncoordinated": ("network", "naive"),
+        "greenwave_observed": ("network", "greenwave"),
+        "actuated": ("network", "actuated"),
+        "max_pressure": ("network", "max_pressure"),
     }
     if include_rl:
         try:
-            contenders["rl_shared"] = registry["rl"]()
+            registry["rl"]()  # probe: weights must exist on disk
+            contenders["rl_shared"] = ("network", "rl")
         except FileNotFoundError:
             print("(no trained network RL weights found — skipping rl contender)")
 
+    tasks = [(spec, config, s) for spec in contenders.values() for s in seeds]
+    flat = pool.map(run_network_task, tasks)
+    pool.close()
     results: dict[str, dict] = {}
-    for name, controller in contenders.items():
-        runs_out = [run_network_controller(controller, config, s) for s in seeds]
+    for i, name in enumerate(contenders):
+        runs_out = flat[i * len(seeds) : (i + 1) * len(seeds)]
         results[name] = {
             "p95": mean_ci(np.array([r["p95_wait"] for r in runs_out])),
             "mean": mean_ci(np.array([r["mean_wait"] for r in runs_out])),
@@ -774,7 +1010,7 @@ def optimize_corridor_from_counts(
         )
 
     y, ar = timing.yellow, timing.all_red
-    baseline_key = "naive_uncoordinated"
+    baseline_key = "current_practice"
     diff = paired_diff_ci(
         np.array(results[baseline_key]["p95_runs"]),
         np.array(results["optimized_tod_coordinated"]["p95_runs"]),
@@ -787,6 +1023,11 @@ def optimize_corridor_from_counts(
         "link_travel_s": link_travel,
         "n_runs": runs,
         "baseline": baseline_key,
+        "baseline_source": (
+            f"assumed typical practice: common cycle {practice_cycle:.0f} s "
+            "(FHWA STM 60-120 s range), splits proportional to peak counts, "
+            "simultaneous offsets"
+        ),
         "recommended_plans": [
             {
                 "start_hour": start / 3600.0,
@@ -903,6 +1144,10 @@ def main() -> None:
         "for the ITE/MUTCD clearance formulas and the left-turn warrant",
     )
     parser.add_argument(
+        "--jobs", type=int, default=None,
+        help="worker processes for simulation runs (default: all cores; 1 = serial)",
+    )
+    parser.add_argument(
         "--train-site", type=int, nargs="?", const=600_000, default=0, metavar="STEPS",
         help="single-intersection mode: also TRAIN a site-specific ML policy on demand "
         "patterns sampled around this data (default 600k steps, ~2 min) and include it "
@@ -917,7 +1162,7 @@ def main() -> None:
             parser.error("--train-site currently supports single-intersection data only")
         optimize_corridor_from_counts(
             args.data, runs=args.runs, seed=args.seed, out_dir=args.out,
-            link_travel=args.link_travel, include_rl=not args.no_rl,
+            link_travel=args.link_travel, include_rl=not args.no_rl, jobs=args.jobs,
         )
     else:
         from traffic_rl.data import load_site_json
@@ -930,7 +1175,7 @@ def main() -> None:
             args.data, runs=args.runs, seed=args.seed, out_dir=args.out,
             current_plan=current, include_rl=not args.no_rl,
             train_site_steps=args.train_site,
-            site=site, site_from_file=args.site is not None,
+            site=site, site_from_file=args.site is not None, jobs=args.jobs,
         )
 
 
