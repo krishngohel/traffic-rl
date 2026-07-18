@@ -176,10 +176,18 @@ _BOX_FACES = [
 ]
 
 
+# Camera presets cycled with the C key: (name, eye, target, focal).
+CAMERA_PRESETS = [
+    ("overview", (96.0, -20.0, 62.0), (0.0, 3.0, 0.0), 1150.0),
+    ("street", (52.0, -46.0, 17.0), (0.0, -2.0, 1.5), 1500.0),
+    ("corner", (34.0, 30.0, 12.0), (-4.0, -4.0, 1.0), 1350.0),
+]
+
+
 class Camera:
     """Elevated three-quarter perspective view from the east."""
 
-    def __init__(self, eye=(108.0, -22.0, 74.0), target=(0.0, 4.0, 0.0), focal=1080.0):
+    def __init__(self, eye=(96.0, -20.0, 62.0), target=(0.0, 3.0, 0.0), focal=1150.0):
         self.eye = np.asarray(eye, dtype=np.float64)
         self.focal = focal
         fwd = np.asarray(target) - self.eye
@@ -338,6 +346,7 @@ class ViewerApp:
         self.cam = Camera()
         self.paused = False
         self._ground_cache: dict = {}
+        self._cam_preset = 0
         self.animator = CarAnimator(self.config)
         self.learner = None
         self.learn_out = None
@@ -865,7 +874,7 @@ class ViewerApp:
                 f"learning  eps {lr.epsilon:.2f}  steps {lr.steps:,}"
                 f"  updates {lr.updates:,}  reward ema {lr.reward_ema:6.3f}"
             )
-        lines.append("Space pause · +/- speed · R reset · Esc quit")
+        lines.append("Space pause · +/- speed · C camera · wheel zoom · R reset · Esc quit")
         pad, lh = 12, 22
         panel = pygame.Surface((520, pad * 2 + lh * len(lines)), pygame.SRCALPHA)
         panel.fill((10, 10, 10, 175))
@@ -904,6 +913,16 @@ class ViewerApp:
                     elif event.key == pygame.K_r:
                         self.seed += 1
                         self._reset()
+                    elif event.key == pygame.K_c:
+                        self._cam_preset = (self._cam_preset + 1) % len(CAMERA_PRESETS)
+                        _name, eye, target, focal = CAMERA_PRESETS[self._cam_preset]
+                        self.cam = Camera(eye=eye, target=target, focal=focal)
+                        self._ground_cache.clear()
+                elif event.type == pygame.MOUSEWHEEL and event.y:
+                    focal = float(np.clip(self.cam.focal * (1.12 ** event.y), 500, 4000))
+                    if focal != self.cam.focal:
+                        self.cam.focal = focal
+                        self._ground_cache.clear()
             if not self.paused:
                 self._advance(min(frame_dt, 0.1))
             self.draw(screen, font)
