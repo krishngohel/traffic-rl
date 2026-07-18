@@ -8,6 +8,27 @@ honest simulator, the classic strategies traffic engineers already use as real
 opponents, and a retiming tool that turns the count data cities already
 collect into implementable timing sheets.
 
+## Measured results
+
+Every number below is produced by this repo's own evaluation harness — paired
+seeds, per-run p95/mean waits, t-based 95% CIs — on the bundled example data,
+and is reproducible with the commands shown later in this README.
+
+| Case | Before | After | Change |
+|---|---|---|---|
+| Rush-hour corridor (4 signals): coordinated retiming vs uncoordinated equal splits | 764 s journey p95 | **69 s** | **−91%** |
+| 5-hour AM intersection: recommended time-of-day plans vs naive 50/50 signal | 101.5 s p95 wait | **42.3 s** | **−58%** |
+| Same study vs the realistic current-practice baseline (FHWA-typical timings) | 44.2 s p95 | **42.3 s** | −4% (honest: most of the naive gap is already captured by standard practice) |
+| Online learning (`--learn`): RL policy self-tuning on its worst scenario, ~2 min of self-play, scored on 20 unseen paired seeds | 54.8 s mean wait | **29.3 s** | **−47%** (paired CI [23.2, 27.9] s) |
+| Learned corridor policy vs the 1960s actuated controller (rush corridor, 20 paired seeds) | 88.4 s journey p95 | **78.4 s** | **−10.0 s** (paired CI [4.6, 15.5]) |
+| Full evaluation suite wall time (32-core desktop, bit-identical results) | ~10 min | **< 1 min** | 7–15× |
+
+The counterweight numbers are published with the same care: at isolated
+intersections the classic actuated controller still wins every scenario
+(34.1 s p95 on the AM example vs 36.5 s for the learned policy), and where the
+optimizer cannot beat an intersection's current plan it says "no retiming
+warranted" instead of manufacturing an improvement.
+
 **The current verdict, up front.** Phase 5 made the model realistic — turning
 movements, protected/permissive lefts, multi-lane approaches, ITE/MUTCD
 clearance intervals from site geometry — and realism redrew the scoreboard
