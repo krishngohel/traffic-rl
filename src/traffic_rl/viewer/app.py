@@ -72,50 +72,93 @@ CAR_COLORS = [
     (208, 176, 60),  # gold
 ]
 
-# Car body styles: (offset along heading, offset across, size (L, W, H),
-# base z, kind) where kind is "body" | "glass". Wheels and lights are added
-# procedurally from the footprint.
+# Car body styles: boxes are ((offset along heading, offset across),
+# (L, W, H), base z, kind) with kind "body" | "glass" | "trim" (dark plastic:
+# bumpers, roof rails). Wheels, hubs, mirrors, and light strips are added
+# procedurally from the footprint; "mirror_along" places the side mirrors.
 CAR_MODELS = {
     "sedan": {
         "boxes": [
-            ((0.0, 0.0), (4.5, 1.9, 0.62), 0.34, "body"),
-            ((0.55, 0.0), (2.2, 1.82, 0.30), 0.96, "body"),   # hood
-            ((-0.35, 0.0), (2.3, 1.7, 0.72), 0.96, "glass"),  # cabin
+            ((0.0, 0.0), (4.5, 1.88, 0.60), 0.36, "body"),
+            ((1.35, 0.0), (1.75, 1.80, 0.26), 0.96, "body"),   # hood
+            ((-1.55, 0.0), (1.35, 1.80, 0.30), 0.96, "body"),  # trunk
+            ((-0.15, 0.0), (2.15, 1.66, 0.62), 0.96, "glass"),  # greenhouse
+            ((-0.15, 0.0), (1.55, 1.44, 0.16), 1.58, "body"),  # roof cap
+            ((2.28, 0.0), (0.24, 1.86, 0.34), 0.34, "trim"),   # bumpers
+            ((-2.28, 0.0), (0.24, 1.86, 0.34), 0.34, "trim"),
         ],
-        "foot": (4.5, 1.9),
+        "foot": (4.5, 1.88),
+        "mirror_along": 0.85,
     },
     "suv": {
         "boxes": [
-            ((0.0, 0.0), (4.7, 2.0, 0.85), 0.40, "body"),
-            ((-0.15, 0.0), (3.0, 1.88, 0.85), 1.25, "glass"),
+            ((0.0, 0.0), (4.7, 1.98, 0.80), 0.42, "body"),
+            ((1.65, 0.0), (1.35, 1.90, 0.30), 1.22, "body"),   # hood
+            ((-0.45, 0.0), (2.85, 1.80, 0.72), 1.22, "glass"),
+            ((-0.45, 0.0), (2.35, 1.62, 0.16), 1.94, "body"),  # roof
+            ((-0.45, 0.62), (2.05, 0.10, 0.10), 2.10, "trim"),  # roof rails
+            ((-0.45, -0.62), (2.05, 0.10, 0.10), 2.10, "trim"),
+            ((2.40, 0.0), (0.24, 1.94, 0.40), 0.36, "trim"),
+            ((-2.40, 0.0), (0.24, 1.94, 0.40), 0.36, "trim"),
         ],
-        "foot": (4.7, 2.0),
+        "foot": (4.7, 1.98),
+        "mirror_along": 1.05,
     },
     "pickup": {
         "boxes": [
-            ((-1.35, 0.0), (2.1, 2.0, 0.9), 0.38, "body"),    # bed
-            ((0.45, 0.0), (2.9, 2.0, 0.95), 0.38, "body"),    # cab base
-            ((0.75, 0.0), (1.7, 1.9, 0.75), 1.33, "glass"),
+            ((-1.30, 0.0), (2.35, 2.0, 0.85), 0.40, "body"),    # bed walls
+            ((-1.30, 0.0), (2.05, 1.70, 0.18), 0.62, "trim"),   # bed floor
+            ((0.75, 0.0), (2.55, 2.0, 0.90), 0.40, "body"),     # cab base
+            ((1.75, 0.0), (0.85, 1.92, 0.28), 1.30, "body"),    # hood nose
+            ((0.55, 0.0), (1.55, 1.82, 0.68), 1.30, "glass"),
+            ((0.55, 0.0), (1.15, 1.60, 0.14), 1.98, "body"),
+            ((2.45, 0.0), (0.26, 1.96, 0.42), 0.34, "trim"),
+            ((-2.55, 0.0), (0.26, 1.96, 0.42), 0.34, "trim"),
         ],
         "foot": (5.1, 2.0),
+        "mirror_along": 1.25,
     },
     "van": {
         "boxes": [
-            ((0.0, 0.0), (5.1, 2.05, 1.15), 0.38, "body"),
-            ((0.4, 0.0), (3.6, 1.95, 0.95), 1.53, "glass"),
+            ((0.0, 0.0), (5.1, 2.02, 1.10), 0.40, "body"),
+            ((2.05, 0.0), (0.95, 1.94, 0.55), 1.50, "glass"),   # windshield
+            ((-0.35, 0.0), (3.35, 1.94, 0.85), 1.50, "body"),   # cargo top
+            ((-0.35, 0.0), (3.35, 1.94, 0.14), 2.35, "body"),
+            ((2.60, 0.0), (0.24, 1.98, 0.42), 0.34, "trim"),
+            ((-2.60, 0.0), (0.24, 1.98, 0.42), 0.34, "trim"),
         ],
-        "foot": (5.1, 2.05),
+        "foot": (5.1, 2.02),
+        "mirror_along": 1.95,
     },
     "coupe": {
         "boxes": [
-            ((0.0, 0.0), (4.2, 1.85, 0.55), 0.32, "body"),
-            ((0.65, 0.0), (1.9, 1.78, 0.26), 0.87, "body"),
-            ((-0.5, 0.0), (1.9, 1.62, 0.58), 0.87, "glass"),
+            ((0.0, 0.0), (4.2, 1.84, 0.52), 0.34, "body"),
+            ((1.30, 0.0), (1.60, 1.76, 0.22), 0.86, "body"),    # long hood
+            ((-0.55, 0.0), (1.75, 1.58, 0.52), 0.86, "glass"),  # fastback
+            ((-0.55, 0.0), (1.05, 1.36, 0.13), 1.38, "body"),
+            ((2.12, 0.0), (0.22, 1.82, 0.30), 0.32, "trim"),
+            ((-2.12, 0.0), (0.22, 1.82, 0.30), 0.32, "trim"),
         ],
-        "foot": (4.2, 1.85),
+        "foot": (4.2, 1.84),
+        "mirror_along": 0.65,
+    },
+    "hatch": {
+        "boxes": [
+            ((0.1, 0.0), (3.7, 1.78, 0.58), 0.36, "body"),
+            ((1.25, 0.0), (1.15, 1.70, 0.24), 0.94, "body"),    # stub hood
+            ((-0.35, 0.0), (2.15, 1.62, 0.62), 0.94, "glass"),  # tall glass
+            ((-0.35, 0.0), (1.75, 1.42, 0.15), 1.56, "body"),
+            ((1.92, 0.0), (0.22, 1.76, 0.32), 0.34, "trim"),
+            ((-1.72, 0.0), (0.22, 1.76, 0.32), 0.34, "trim"),
+        ],
+        "foot": (3.7, 1.78),
+        "mirror_along": 0.65,
     },
 }
 MODEL_NAMES = list(CAR_MODELS)
+TRIM_COLOR = (40, 40, 44)
+HUB_COLOR = (168, 170, 176)
+GLASS_TINT = (72, 96, 118)  # cool blue-gray, blended with body color
 
 SUN = np.array([-0.40, 0.30, -0.87])
 SUN = SUN / np.linalg.norm(SUN)
@@ -157,21 +200,29 @@ _FACE_IDX = np.array([list(idx) for idx, _ in _BOX_FACES])  # (6, 4)
 _FACE_NORMALS = np.array([n for _, n in _BOX_FACES], dtype=np.float64)  # (6, 3)
 
 
+FOG_COLOR = np.array([118.0, 138.0, 112.0])  # distant haze blends toward grass
+
+
 class BoxBatch:
     """Collects yawed boxes and projects/shades them all in one numpy pass —
-    per-box numpy calls were the viewer's frame-rate bottleneck."""
+    a software 'shader': lambert diffuse + Blinn-style sun specular per
+    material, ground-proximity ambient occlusion, and distance haze."""
 
     def __init__(self):
         self.centers: list = []
         self.sizes: list = []
         self.yaws: list = []
         self.colors: list = []
+        self.specs: list = []
 
-    def add(self, center, size, color, yaw: float = 0.0) -> None:
+    def add(self, center, size, color, yaw: float = 0.0, spec: float = 0.0) -> None:
+        """spec is the material's specular strength: 0 matte (foliage,
+        asphalt-side boxes), ~0.3 car paint, ~0.9 glass and chrome."""
         self.centers.append(center)
         self.sizes.append(size)
         self.yaws.append(yaw)
         self.colors.append(color)
+        self.specs.append(spec)
 
     def flush(self, cam: Camera, out: list) -> None:
         if not self.centers:
@@ -180,6 +231,7 @@ class BoxBatch:
         sizes = np.asarray(self.sizes, dtype=np.float64)
         yaws = np.asarray(self.yaws, dtype=np.float64)
         colors = np.asarray(self.colors, dtype=np.float64)
+        specs = np.asarray(self.specs, dtype=np.float64)
         n = len(centers)
         corners = sizes[:, None, :] * _BOX_CORNERS[None, :, :]  # (n, 8, 3)
         c, s = np.cos(yaws)[:, None], np.sin(yaws)[:, None]
@@ -198,18 +250,38 @@ class BoxBatch:
         view = face_centers - cam.eye
         visible = np.einsum("nfk,nfk->nf", view, normals) < 0.0
         depths = np.linalg.norm(view, axis=2)
-        bright = 0.40 + 0.60 * np.maximum(0.0, -(normals @ SUN))
-        shaded = np.minimum(255, colors[:, None, :] * bright[:, :, None]).astype(np.uint8)
+
+        # Diffuse + fake ambient occlusion (faces hugging the ground darken).
+        ndotl = np.maximum(0.0, normals @ -SUN)  # (n, 6)
+        bright = 0.38 + 0.62 * ndotl
+        bright *= 0.80 + 0.20 * np.clip(face_centers[:, :, 2] / 1.6, 0.0, 1.0)
+        shaded = colors[:, None, :] * bright[:, :, None]
+        # Sun specular: mirror of the light about the normal, dotted with the
+        # view direction — glass and chrome catch bright glints.
+        if specs.any():
+            refl = 2.0 * ndotl[:, :, None] * normals - (-SUN)
+            vdir = -view / depths[:, :, None]
+            glint = np.clip(np.einsum("nfk,nfk->nf", refl, vdir), 0.0, 1.0) ** 22
+            shaded += (glint * specs[:, None] * 235.0)[:, :, None]
+        # Distance haze pulls far geometry toward the horizon tone.
+        f = np.clip((depths - 110.0) / 260.0, 0.0, 0.45)[:, :, None]
+        shaded = shaded * (1.0 - f) + FOG_COLOR * f
+        shaded = np.clip(shaded, 0.0, 255.0).astype(np.uint8)
         for i in range(n):
-            for f in range(6):
-                if visible[i, f]:
+            for face in range(6):
+                if visible[i, face]:
                     out.append(
-                        (float(depths[i, f]), scr[i, _FACE_IDX[f]], tuple(shaded[i, f]))
+                        (
+                            float(depths[i, face]),
+                            scr[i, _FACE_IDX[face]],
+                            tuple(shaded[i, face]),
+                        )
                     )
         self.centers.clear()
         self.sizes.clear()
         self.yaws.clear()
         self.colors.clear()
+        self.specs.clear()
 
 
 def _flat_quad(cam: Camera, screen, corners_xy, color, z=0.02) -> None:
@@ -386,8 +458,37 @@ class ViewerApp:
             surf = pygame.Surface((W, H))
             surf.fill(GRASS)
             self._draw_ground(surf)
+            self._draw_static_shadows(surf)
             self._ground_cache[key] = surf
         screen.blit(surf, (0, 0))
+
+    def _draw_static_shadows(self, surf) -> None:
+        """Sun shadows for trees, buildings, and poles, baked into the cached
+        ground (they never move)."""
+        overlay = pygame.Surface((W, H), pygame.SRCALPHA)
+        ox, oy = self._SHADOW_SHIFT
+
+        def blob(cx, cy, half_l, half_w, height, alpha=80):
+            # Quad stretched from the object's base to where its top's shadow
+            # lands — a cheap projected silhouette.
+            ex, ey = ox * height, oy * height
+            quad = [(cx - half_l, cy - half_w), (cx + half_l, cy - half_w),
+                    (cx + half_l + ex, cy - half_w + ey),
+                    (cx + half_l + ex, cy + half_w + ey),
+                    (cx - half_l + ex, cy + half_w + ey),
+                    (cx - half_l, cy + half_w)]
+            pts = np.array([[qx, qy, 0.012] for qx, qy in quad])
+            scr, _ = self.cam.project(pts)
+            pygame.draw.polygon(overlay, (10, 14, 10, alpha), [tuple(p) for p in scr])
+
+        for tx, ty, s in TREES:
+            blob(tx, ty, 1.8 * s, 1.8 * s, 5.2 * s)
+        for (bx, by), (bl, bw, bh), _color in BUILDINGS:
+            blob(bx, by, bl / 2, bw / 2, bh, alpha=70)
+        for a in range(4):
+            px, py = self.POLE_POS[a]
+            blob(px, py, 0.30, 0.30, 4.6, alpha=60)
+        surf.blit(overlay, (0, 0))
 
     def _draw_ground(self, screen) -> None:
         cam = self.cam
@@ -496,24 +597,45 @@ class ViewerApp:
             if abs(car.pos[0]) < 100 and abs(car.pos[1]) < 100:
                 yield car
 
+    # Where a unit-height object's shadow lands: xy + h * SUNxy / |SUNz|.
+    _SHADOW_SHIFT = (float(SUN[0] / abs(SUN[2])), float(SUN[1] / abs(SUN[2])))
+
     def _draw_car_shadows(self, screen) -> None:
+        """Sun-projected soft shadows on a per-frame alpha layer."""
+        if not hasattr(self, "_shadow_surf"):
+            self._shadow_surf = pygame.Surface((W, H), pygame.SRCALPHA)
+        surf = self._shadow_surf
+        surf.fill((0, 0, 0, 0))
         cam = self.cam
+        ox, oy = self._SHADOW_SHIFT
+        drew = False
         for car in self._visible_cars():
             model = CAR_MODELS[_car_style(car.veh_id)[0]]
             length, width = model["foot"]
             hx, hy = car.heading
             px, py = car.pos
-            ax, ay = hx * (length / 2 + 0.25), hy * (length / 2 + 0.25)
-            bx, by = -hy * (width / 2 + 0.22), hx * (width / 2 + 0.22)
+            px += ox * 0.55  # body mass sits ~0.55 m up; shadow shifts sunward
+            py += oy * 0.55
+            ax, ay = hx * (length / 2 + 0.35), hy * (length / 2 + 0.35)
+            bx, by = -hy * (width / 2 + 0.30), hx * (width / 2 + 0.30)
             quad = [(px - ax - bx, py - ay - by), (px + ax - bx, py + ay - by),
                     (px + ax + bx, py + ay + by), (px - ax + bx, py - ay + by)]
-            _flat_quad(cam, screen, quad, ASPHALT_SHADOW, z=0.015)
+            pts = np.array([[qx, qy, 0.015] for qx, qy in quad])
+            scr, _ = cam.project(pts)
+            pygame.draw.polygon(surf, (10, 12, 10, 88), [tuple(p) for p in scr])
+            drew = True
+        if drew:
+            screen.blit(surf, (0, 0))
 
     def _car_faces(self, batch: BoxBatch) -> None:
         for car in self._visible_cars():
             name, color = _car_style(car.veh_id)
             model = CAR_MODELS[name]
-            glass = tuple(int(c * 0.42) for c in color)
+            # Tinted glass: mostly the cool tint, a hint of the body color.
+            glass = tuple(
+                int(0.72 * t + 0.28 * c * 0.5)
+                for t, c in zip(GLASS_TINT, color, strict=True)
+            )
             hx, hy = car.heading
             yaw = float(np.arctan2(hy, hx))
             px, py = car.pos
@@ -521,20 +643,36 @@ class ViewerApp:
             for (along, across), (bl, bw, bh), z0, kind in model["boxes"]:
                 cx = px + hx * along - hy * across
                 cy = py + hy * along + hx * across
-                batch.add((cx, cy, z0), (bl, bw, bh),
-                          glass if kind == "glass" else color, yaw=yaw)
-            # Wheels at the footprint corners.
-            wx, wy = length / 2 - 0.75, width / 2 - 0.02
+                if kind == "glass":
+                    batch.add((cx, cy, z0), (bl, bw, bh), glass, yaw=yaw, spec=0.90)
+                elif kind == "trim":
+                    batch.add((cx, cy, z0), (bl, bw, bh), TRIM_COLOR, yaw=yaw, spec=0.06)
+                else:
+                    batch.add((cx, cy, z0), (bl, bw, bh), color, yaw=yaw, spec=0.34)
+            # Wheels: tire + a brighter hub poking through the outer face.
+            wx, wy = length / 2 - 0.78, width / 2 - 0.02
             for sa in (1, -1):
                 for sb in (1, -1):
                     cx = px + hx * (sa * wx) - hy * (sb * wy)
                     cy = py + hy * (sa * wx) + hx * (sb * wy)
-                    batch.add((cx, cy, 0.0), (0.72, 0.28, 0.66), TIRE, yaw=yaw)
+                    batch.add((cx, cy, 0.0), (0.74, 0.30, 0.68), TIRE, yaw=yaw)
+                    hx2 = px + hx * (sa * wx) - hy * (sb * (wy + 0.06))
+                    hy2 = py + hy * (sa * wx) + hx * (sb * (wy + 0.06))
+                    batch.add((hx2, hy2, 0.16), (0.34, 0.22, 0.34), HUB_COLOR,
+                              yaw=yaw, spec=0.75)
+            # Side mirrors.
+            ma = model["mirror_along"]
+            for sb in (1, -1):
+                cx = px + hx * ma - hy * (sb * (width / 2 + 0.14))
+                cy = py + hy * ma + hx * (sb * (width / 2 + 0.14))
+                batch.add((cx, cy, 0.98), (0.24, 0.20, 0.20), TRIM_COLOR,
+                          yaw=yaw, spec=0.3)
             # Head / tail light strips.
             for sa, lcolor in ((1, HEADLIGHT), (-1, TAILLIGHT)):
                 cx = px + hx * (sa * (length / 2 + 0.02))
                 cy = py + hy * (sa * (length / 2 + 0.02))
-                batch.add((cx, cy, 0.52), (0.10, width * 0.72, 0.16), lcolor, yaw=yaw)
+                batch.add((cx, cy, 0.52), (0.10, width * 0.70, 0.17), lcolor,
+                          yaw=yaw, spec=0.85)
 
     # ----------------------------------------------------------------- signals
 
