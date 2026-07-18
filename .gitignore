@@ -7,3 +7,4 @@ __pycache__/
 .coverage
 results/
 dist/
+web_build/

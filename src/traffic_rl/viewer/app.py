@@ -291,6 +291,18 @@ BUILDINGS = [
 ]
 
 
+def _available_controllers() -> list[str]:
+    """Registry names whose weights actually exist on disk."""
+    names = []
+    for name in CONTROLLER_REGISTRY:
+        try:
+            CONTROLLER_REGISTRY[name]()
+            names.append(name)
+        except FileNotFoundError:
+            pass
+    return names
+
+
 class ViewerApp:
     def __init__(
         self,
@@ -306,20 +318,30 @@ class ViewerApp:
         self.scenario = scenario
         self.speed = speed
         self.seed = seed
-        self.config = make_config(scenario)
-        self.sim = IntersectionSim(self.config)
         self.cam = Camera()
         self.paused = False
         self._ground_cache: dict = {}
         self._cam_preset = 0
+        self.learn = learn
+        self.learn_fresh = learn_fresh
+        self.learn_out = learn_out
+        self.menu_open = False
+        self._menu_hits: list = []  # (rect, action) rebuilt each drawn frame
+        self._controller_choices = _available_controllers()
+        self._configure()
+
+    def _configure(self) -> None:
+        """(Re)build everything that depends on the scenario or learn mode —
+        called at startup and whenever the in-window settings change."""
+        self.config = make_config(self.scenario)
+        self.sim = IntersectionSim(self.config)
         self.animator = CarAnimator(self.config)
         self.learner = None
-        self.learn_out = None
-        if learn:
+        if self.learn:
             from traffic_rl.rl.online import DEFAULT_ONLINE_OUT, OnlineLearner
 
-            self.learner = OnlineLearner(seed, fresh=learn_fresh)
-            self.learn_out = learn_out or DEFAULT_ONLINE_OUT
+            self.learner = OnlineLearner(self.seed, fresh=self.learn_fresh)
+            self.learn_out = self.learn_out or DEFAULT_ONLINE_OUT
             self._last_autosave = 0
         self._reset()
 
@@ -840,7 +862,7 @@ class ViewerApp:
                 f"learning  eps {lr.epsilon:.2f}  steps {lr.steps:,}"
                 f"  updates {lr.updates:,}  reward ema {lr.reward_ema:6.3f}"
             )
-        lines.append("Space pause · +/- speed · C camera · wheel zoom · R reset · Esc quit")
+        lines.append("click settings · Space pause · +/- speed · C camera · wheel zoom · R reset")
         pad, lh = 12, 22
         panel = pygame.Surface((520, pad * 2 + lh * len(lines)), pygame.SRCALPHA)
         panel.fill((10, 10, 10, 175))
@@ -854,7 +876,133 @@ class ViewerApp:
 
     # ------------------------------------------------------------------ loop
 
-    def run(self, smoke_frames: int | None = None, screenshot: str | None = None) -> None:
+    # -------------------------------------------------------- settings panel
+
+    def _cycle_camera(self) -> None:
+        self._cam_preset = (self._cam_preset + 1) % len(CAMERA_PRESETS)
+        _name, eye, target, focal = CAMERA_PRESETS[self._cam_preset]
+        self.cam = Camera(eye=eye, target=target, focal=focal)
+        self._ground_cache.clear()
+
+    def _menu_action(self, action: tuple) -> None:
+        kind, arg = action
+        if kind == "menu":
+            self.menu_open = not self.menu_open
+        elif kind == "controller":
+            names = self._controller_choices
+            base = self.controller_name if self.controller_name in names else names[0]
+            self.controller_name = names[(names.index(base) + arg) % len(names)]
+            self.learn = False
+            self._configure()
+        elif kind == "scenario":
+            keys = list(SCENARIOS)
+            self.scenario = keys[(keys.index(self.scenario) + arg) % len(keys)]
+            self._configure()
+        elif kind == "speed":
+            self.speed = float(np.clip(self.speed * (2.0 if arg > 0 else 0.5), 1.0, 1024.0))
+        elif kind == "camera":
+            self._cycle_camera()
+        elif kind == "learn":
+            self.learn = not self.learn
+            self._configure()
+        elif kind == "seed":
+            self.seed += 1
+            self._reset()
+        elif kind == "pause":
+            self.paused = not self.paused
+
+    def _draw_menu(self, screen, font) -> None:
+        """Clickable settings: a gear button, and when open, rows of
+        < value > steppers. Hit rectangles are rebuilt every frame."""
+        self._menu_hits = []
+        gear = pygame.Rect(W - 132, 10, 122, 30)
+        pygame.draw.rect(screen, (18, 18, 18), gear, border_radius=6)
+        pygame.draw.rect(screen, (90, 90, 88), gear, width=1, border_radius=6)
+        label = font.render("settings", True, HUD_INK)
+        screen.blit(label, label.get_rect(center=gear.center))
+        self._menu_hits.append((gear, ("menu", 0)))
+        if not self.menu_open:
+            return
+        cam_name = CAMERA_PRESETS[self._cam_preset][0]
+        rows = [
+            ("mode", "learning AI" if self.learn else self.controller_name,
+             ("controller", -1), ("controller", 1)),
+            ("scenario", self.scenario, ("scenario", -1), ("scenario", 1)),
+            ("speed", f"{self.speed:.0f}x", ("speed", -1), ("speed", 1)),
+            ("camera", cam_name, ("camera", 0), ("camera", 0)),
+            ("self-learning", "ON" if self.learn else "off",
+             ("learn", 0), ("learn", 0)),
+            ("new traffic", f"seed {self.seed}", ("seed", 0), ("seed", 0)),
+            ("paused" if self.paused else "running", "toggle",
+             ("pause", 0), ("pause", 0)),
+        ]
+        row_h, panel_w = 34, 300
+        panel = pygame.Rect(W - panel_w - 10, 46, panel_w, 12 + row_h * len(rows))
+        surf = pygame.Surface(panel.size, pygame.SRCALPHA)
+        surf.fill((12, 12, 12, 215))
+        screen.blit(surf, panel.topleft)
+        pygame.draw.rect(screen, (90, 90, 88), panel, width=1, border_radius=6)
+        y = panel.top + 8
+        for name, value, left_act, right_act in rows:
+            screen.blit(font.render(name, True, HUD_DIM), (panel.left + 12, y + 4))
+            lbtn = pygame.Rect(panel.left + 112, y, 26, row_h - 8)
+            rbtn = pygame.Rect(panel.right - 38, y, 26, row_h - 8)
+            for btn, glyph in ((lbtn, "<"), (rbtn, ">")):
+                pygame.draw.rect(screen, (34, 34, 34), btn, border_radius=4)
+                g = font.render(glyph, True, HUD_INK)
+                screen.blit(g, g.get_rect(center=btn.center))
+            val = font.render(str(value), True, HUD_INK)
+            mid = pygame.Rect(lbtn.right, y, rbtn.left - lbtn.right, row_h - 8)
+            screen.blit(val, val.get_rect(center=mid.center))
+            self._menu_hits.append((lbtn, left_act))
+            self._menu_hits.append((rbtn, right_act))
+            self._menu_hits.append((mid, right_act))
+            y += row_h
+
+    def _handle_event(self, event) -> bool:
+        """Returns False when the app should quit."""
+        if event.type == pygame.QUIT:
+            return False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for rect, action in self._menu_hits:
+                if rect.collidepoint(event.pos):
+                    self._menu_action(action)
+                    return True
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                if self.menu_open:
+                    self.menu_open = False
+                    return True
+                return False
+            if event.key == pygame.K_SPACE:
+                self.paused = not self.paused
+            elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+                self.speed = min(self.speed * 2, 1024.0)
+            elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                self.speed = max(self.speed / 2, 1.0)
+            elif event.key == pygame.K_r:
+                self.seed += 1
+                self._reset()
+            elif event.key == pygame.K_c:
+                self._cycle_camera()
+            elif event.key == pygame.K_TAB:
+                self.menu_open = not self.menu_open
+        elif event.type == pygame.MOUSEWHEEL and event.y:
+            focal = float(np.clip(self.cam.focal * (1.12 ** event.y), 500, 4000))
+            if focal != self.cam.focal:
+                self.cam.focal = focal
+                self._ground_cache.clear()
+        return True
+
+    # ------------------------------------------------------------------ loop
+
+    async def run_async(
+        self, smoke_frames: int | None = None, screenshot: str | None = None
+    ) -> None:
+        """Main loop, async so the same code runs on desktop and — via
+        pygbag/WebAssembly — in a browser tab."""
+        import asyncio
+
         pygame.init()
         screen = pygame.display.set_mode((W, H))
         pygame.display.set_caption("traffic-rl")
@@ -865,43 +1013,31 @@ class ViewerApp:
         while running:
             frame_dt = clock.tick(60) / 1000.0
             for event in pygame.event.get():
-                if event.type == pygame.QUIT:
+                if not self._handle_event(event):
                     running = False
-                elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        running = False
-                    elif event.key == pygame.K_SPACE:
-                        self.paused = not self.paused
-                    elif event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
-                        self.speed = min(self.speed * 2, 1024.0)
-                    elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
-                        self.speed = max(self.speed / 2, 1.0)
-                    elif event.key == pygame.K_r:
-                        self.seed += 1
-                        self._reset()
-                    elif event.key == pygame.K_c:
-                        self._cam_preset = (self._cam_preset + 1) % len(CAMERA_PRESETS)
-                        _name, eye, target, focal = CAMERA_PRESETS[self._cam_preset]
-                        self.cam = Camera(eye=eye, target=target, focal=focal)
-                        self._ground_cache.clear()
-                elif event.type == pygame.MOUSEWHEEL and event.y:
-                    focal = float(np.clip(self.cam.focal * (1.12 ** event.y), 500, 4000))
-                    if focal != self.cam.focal:
-                        self.cam.focal = focal
-                        self._ground_cache.clear()
             if not self.paused:
                 self._advance(min(frame_dt, 0.1))
             self.draw(screen, font)
+            self._draw_menu(screen, font)
             pygame.display.flip()
+            await asyncio.sleep(0)
             frames += 1
             if smoke_frames is not None and frames >= smoke_frames:
                 running = False
         if screenshot:
             pygame.image.save(screen, screenshot)
         if self.learner and self.learner.steps > 0:
-            self.learner.save(self.learn_out)
-            print(f"saved online-learned weights -> {self.learn_out}")
+            try:
+                self.learner.save(self.learn_out)
+                print(f"saved online-learned weights -> {self.learn_out}")
+            except OSError:
+                pass  # read-only browser filesystem
         pygame.quit()
+
+    def run(self, smoke_frames: int | None = None, screenshot: str | None = None) -> None:
+        import asyncio
+
+        asyncio.run(self.run_async(smoke_frames=smoke_frames, screenshot=screenshot))
 
 
 def main() -> None:
