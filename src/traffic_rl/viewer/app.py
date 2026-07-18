@@ -31,6 +31,7 @@ from traffic_rl.scenarios import SCENARIOS, make_config
 from traffic_rl.sim.core import IntersectionSim
 from traffic_rl.sim.signal import SignalState
 from traffic_rl.viewer.anim import LANE_X, ROAD_HALF, STOP, CarAnimator, to_world
+from traffic_rl.viewer.meshes import build_car_meshes
 
 W, H = 1120, 840
 
@@ -72,93 +73,15 @@ CAR_COLORS = [
     (208, 176, 60),  # gold
 ]
 
-# Car body styles: boxes are ((offset along heading, offset across),
-# (L, W, H), base z, kind) with kind "body" | "glass" | "trim" (dark plastic:
-# bumpers, roof rails). Wheels, hubs, mirrors, and light strips are added
-# procedurally from the footprint; "mirror_along" places the side mirrors.
-CAR_MODELS = {
-    "sedan": {
-        "boxes": [
-            ((0.0, 0.0), (4.5, 1.88, 0.60), 0.36, "body"),
-            ((1.35, 0.0), (1.75, 1.80, 0.26), 0.96, "body"),   # hood
-            ((-1.55, 0.0), (1.35, 1.80, 0.30), 0.96, "body"),  # trunk
-            ((-0.15, 0.0), (2.15, 1.66, 0.62), 0.96, "glass"),  # greenhouse
-            ((-0.15, 0.0), (1.55, 1.44, 0.16), 1.58, "body"),  # roof cap
-            ((2.28, 0.0), (0.24, 1.86, 0.34), 0.34, "trim"),   # bumpers
-            ((-2.28, 0.0), (0.24, 1.86, 0.34), 0.34, "trim"),
-        ],
-        "foot": (4.5, 1.88),
-        "mirror_along": 0.85,
-    },
-    "suv": {
-        "boxes": [
-            ((0.0, 0.0), (4.7, 1.98, 0.80), 0.42, "body"),
-            ((1.65, 0.0), (1.35, 1.90, 0.30), 1.22, "body"),   # hood
-            ((-0.45, 0.0), (2.85, 1.80, 0.72), 1.22, "glass"),
-            ((-0.45, 0.0), (2.35, 1.62, 0.16), 1.94, "body"),  # roof
-            ((-0.45, 0.62), (2.05, 0.10, 0.10), 2.10, "trim"),  # roof rails
-            ((-0.45, -0.62), (2.05, 0.10, 0.10), 2.10, "trim"),
-            ((2.40, 0.0), (0.24, 1.94, 0.40), 0.36, "trim"),
-            ((-2.40, 0.0), (0.24, 1.94, 0.40), 0.36, "trim"),
-        ],
-        "foot": (4.7, 1.98),
-        "mirror_along": 1.05,
-    },
-    "pickup": {
-        "boxes": [
-            ((-1.30, 0.0), (2.35, 2.0, 0.85), 0.40, "body"),    # bed walls
-            ((-1.30, 0.0), (2.05, 1.70, 0.18), 0.62, "trim"),   # bed floor
-            ((0.75, 0.0), (2.55, 2.0, 0.90), 0.40, "body"),     # cab base
-            ((1.75, 0.0), (0.85, 1.92, 0.28), 1.30, "body"),    # hood nose
-            ((0.55, 0.0), (1.55, 1.82, 0.68), 1.30, "glass"),
-            ((0.55, 0.0), (1.15, 1.60, 0.14), 1.98, "body"),
-            ((2.45, 0.0), (0.26, 1.96, 0.42), 0.34, "trim"),
-            ((-2.55, 0.0), (0.26, 1.96, 0.42), 0.34, "trim"),
-        ],
-        "foot": (5.1, 2.0),
-        "mirror_along": 1.25,
-    },
-    "van": {
-        "boxes": [
-            ((0.0, 0.0), (5.1, 2.02, 1.10), 0.40, "body"),
-            ((2.05, 0.0), (0.95, 1.94, 0.55), 1.50, "glass"),   # windshield
-            ((-0.35, 0.0), (3.35, 1.94, 0.85), 1.50, "body"),   # cargo top
-            ((-0.35, 0.0), (3.35, 1.94, 0.14), 2.35, "body"),
-            ((2.60, 0.0), (0.24, 1.98, 0.42), 0.34, "trim"),
-            ((-2.60, 0.0), (0.24, 1.98, 0.42), 0.34, "trim"),
-        ],
-        "foot": (5.1, 2.02),
-        "mirror_along": 1.95,
-    },
-    "coupe": {
-        "boxes": [
-            ((0.0, 0.0), (4.2, 1.84, 0.52), 0.34, "body"),
-            ((1.30, 0.0), (1.60, 1.76, 0.22), 0.86, "body"),    # long hood
-            ((-0.55, 0.0), (1.75, 1.58, 0.52), 0.86, "glass"),  # fastback
-            ((-0.55, 0.0), (1.05, 1.36, 0.13), 1.38, "body"),
-            ((2.12, 0.0), (0.22, 1.82, 0.30), 0.32, "trim"),
-            ((-2.12, 0.0), (0.22, 1.82, 0.30), 0.32, "trim"),
-        ],
-        "foot": (4.2, 1.84),
-        "mirror_along": 0.65,
-    },
-    "hatch": {
-        "boxes": [
-            ((0.1, 0.0), (3.7, 1.78, 0.58), 0.36, "body"),
-            ((1.25, 0.0), (1.15, 1.70, 0.24), 0.94, "body"),    # stub hood
-            ((-0.35, 0.0), (2.15, 1.62, 0.62), 0.94, "glass"),  # tall glass
-            ((-0.35, 0.0), (1.75, 1.42, 0.15), 1.56, "body"),
-            ((1.92, 0.0), (0.22, 1.76, 0.32), 0.34, "trim"),
-            ((-1.72, 0.0), (0.22, 1.76, 0.32), 0.34, "trim"),
-        ],
-        "foot": (3.7, 1.78),
-        "mirror_along": 0.65,
-    },
-}
-MODEL_NAMES = list(CAR_MODELS)
+CAR_MESHES = build_car_meshes()
+MODEL_NAMES = list(CAR_MESHES)
 TRIM_COLOR = (40, 40, 44)
 HUB_COLOR = (168, 170, 176)
 GLASS_TINT = (72, 96, 118)  # cool blue-gray, blended with body color
+BLINKER = (255, 188, 48)
+BRAKE_ON, BRAKE_OFF = (255, 52, 44), (140, 42, 38)
+# Per-material specular strengths: body, glass, trim, tire, hub.
+MAT_SPECS = np.array([0.34, 0.90, 0.06, 0.0, 0.75])
 
 SUN = np.array([-0.40, 0.30, -0.87])
 SUN = SUN / np.linalg.norm(SUN)
@@ -211,6 +134,63 @@ _FACE_NORMALS = np.array([n for _, n in _BOX_FACES], dtype=np.float64)  # (6, 3)
 FOG_COLOR = np.array([118.0, 138.0, 112.0])  # distant haze blends toward grass
 
 
+def shade_colors(normals, centers, view, depths, colors, specs) -> np.ndarray:
+    """The software shader, shared by boxes and triangle meshes (flat shapes:
+    (N,3) normals/centers/view/colors, (N,) depths/specs): lambert diffuse,
+    ground-proximity ambient occlusion, Blinn-style sun specular, distance
+    haze. Returns (N,3) uint8."""
+    ndotl = np.maximum(0.0, normals @ -SUN)
+    bright = 0.38 + 0.62 * ndotl
+    bright *= 0.80 + 0.20 * np.clip(centers[:, 2] / 1.6, 0.0, 1.0)
+    shaded = colors * bright[:, None]
+    if specs.any():
+        refl = 2.0 * ndotl[:, None] * normals - (-SUN)
+        vdir = -view / depths[:, None]
+        glint = np.clip(np.einsum("nk,nk->n", refl, vdir), 0.0, 1.0) ** 22
+        shaded = shaded + (glint * specs * 235.0)[:, None]
+    f = np.clip((depths - 110.0) / 260.0, 0.0, 0.45)[:, None]
+    shaded = shaded * (1.0 - f) + FOG_COLOR * f
+    return np.clip(shaded, 0.0, 255.0).astype(np.uint8)
+
+
+class TriBatch:
+    """Triangle meshes (the cars) rendered through the same shader: each mesh
+    instance arrives already transformed to world space; everything projects
+    and shades in one vectorized pass."""
+
+    def __init__(self):
+        self.items: list = []  # (verts_world, tris, normals_world, colors, specs)
+
+    def add_mesh(self, verts, tris, normals, colors, specs) -> None:
+        self.items.append((verts, tris, normals, colors, specs))
+
+    def flush(self, cam: Camera, out: list) -> None:
+        if not self.items:
+            return
+        offsets = np.cumsum([0] + [len(v) for v, *_ in self.items])[:-1]
+        pts = np.vstack([v for v, *_ in self.items])
+        tris = np.vstack(
+            [t + off for (v, t, *_), off in zip(self.items, offsets, strict=True)]
+        )
+        normals = np.vstack([n for _, _, n, _, _ in self.items])
+        colors = np.vstack([c for *_, c, _ in self.items])
+        specs = np.concatenate([s for *_, s in self.items])
+        scr, _ = cam.project(pts)
+        centers = pts[tris].mean(axis=1)  # (T, 3)
+        view = centers - cam.eye
+        visible = np.einsum("nk,nk->n", view, normals) < 0.0
+        depths = np.linalg.norm(view, axis=1)
+        idx = np.flatnonzero(visible)
+        shaded = shade_colors(
+            normals[idx], centers[idx], view[idx], depths[idx], colors[idx], specs[idx]
+        )
+        tri_scr = scr[tris[idx]]  # (K, 3, 2)
+        d = depths[idx]
+        for k in range(len(idx)):
+            out.append((float(d[k]), tri_scr[k], tuple(shaded[k])))
+        self.items.clear()
+
+
 class BoxBatch:
     """Collects yawed boxes and projects/shades them all in one numpy pass —
     a software 'shader': lambert diffuse + Blinn-style sun specular per
@@ -258,33 +238,18 @@ class BoxBatch:
         view = face_centers - cam.eye
         visible = np.einsum("nfk,nfk->nf", view, normals) < 0.0
         depths = np.linalg.norm(view, axis=2)
-
-        # Diffuse + fake ambient occlusion (faces hugging the ground darken).
-        ndotl = np.maximum(0.0, normals @ -SUN)  # (n, 6)
-        bright = 0.38 + 0.62 * ndotl
-        bright *= 0.80 + 0.20 * np.clip(face_centers[:, :, 2] / 1.6, 0.0, 1.0)
-        shaded = colors[:, None, :] * bright[:, :, None]
-        # Sun specular: mirror of the light about the normal, dotted with the
-        # view direction — glass and chrome catch bright glints.
-        if specs.any():
-            refl = 2.0 * ndotl[:, :, None] * normals - (-SUN)
-            vdir = -view / depths[:, :, None]
-            glint = np.clip(np.einsum("nfk,nfk->nf", refl, vdir), 0.0, 1.0) ** 22
-            shaded += (glint * specs[:, None] * 235.0)[:, :, None]
-        # Distance haze pulls far geometry toward the horizon tone.
-        f = np.clip((depths - 110.0) / 260.0, 0.0, 0.45)[:, :, None]
-        shaded = shaded * (1.0 - f) + FOG_COLOR * f
-        shaded = np.clip(shaded, 0.0, 255.0).astype(np.uint8)
-        for i in range(n):
-            for face in range(6):
-                if visible[i, face]:
-                    out.append(
-                        (
-                            float(depths[i, face]),
-                            scr[i, _FACE_IDX[face]],
-                            tuple(shaded[i, face]),
-                        )
-                    )
+        # Flatten (n, 6) faces and shade only the visible ones.
+        flat_idx = np.flatnonzero(visible.reshape(-1))
+        n_flat = normals.reshape(-1, 3)[flat_idx]
+        c_flat = face_centers.reshape(-1, 3)[flat_idx]
+        v_flat = view.reshape(-1, 3)[flat_idx]
+        d_flat = depths.reshape(-1)[flat_idx]
+        col_flat = np.repeat(colors, 6, axis=0)[flat_idx]
+        spec_flat = np.repeat(specs, 6)[flat_idx]
+        shaded = shade_colors(n_flat, c_flat, v_flat, d_flat, col_flat, spec_flat)
+        for k, fi in enumerate(flat_idx):
+            i, face = divmod(int(fi), 6)
+            out.append((float(d_flat[k]), scr[i, _FACE_IDX[face]], tuple(shaded[k])))
         self.centers.clear()
         self.sizes.clear()
         self.yaws.clear()
@@ -441,13 +406,15 @@ class ViewerApp:
         self._blit_ground(screen)
         self._draw_car_shadows(screen)
         batch = BoxBatch()
+        tribatch = TriBatch()
         for a in range(4):
             self._signal_pole_faces(a, batch)
-        self._car_faces(batch)
+        self._car_faces(batch, tribatch)
         self._ped_faces(batch)
         self._scenery_faces(batch)
         faces: list = []
         batch.flush(self.cam, faces)
+        tribatch.flush(self.cam, faces)
         faces.sort(key=lambda f: -f[0])
         for _, quad, color in faces:
             pygame.draw.polygon(screen, color, [tuple(p) for p in quad])
@@ -619,8 +586,7 @@ class ViewerApp:
         ox, oy = self._SHADOW_SHIFT
         drew = False
         for car in self._visible_cars():
-            model = CAR_MODELS[_car_style(car.veh_id)[0]]
-            length, width = model["foot"]
+            length, width = CAR_MESHES[_car_style(car.veh_id)[0]].foot
             hx, hy = car.heading
             px, py = car.pos
             px += ox * 0.55  # body mass sits ~0.55 m up; shadow shifts sunward
@@ -636,10 +602,11 @@ class ViewerApp:
         if drew:
             screen.blit(surf, (0, 0))
 
-    def _car_faces(self, batch: BoxBatch) -> None:
+    def _car_faces(self, batch: BoxBatch, tribatch: TriBatch) -> None:
+        anim_t = self._anim_t
         for car in self._visible_cars():
             name, color = _car_style(car.veh_id)
-            model = CAR_MODELS[name]
+            mesh = CAR_MESHES[name]
             # Tinted glass: mostly the cool tint, a hint of the body color.
             glass = tuple(
                 int(0.72 * t + 0.28 * c * 0.5)
@@ -648,40 +615,39 @@ class ViewerApp:
             hx, hy = car.heading
             yaw = float(np.arctan2(hy, hx))
             px, py = car.pos
-            length, width = model["foot"]
-            for (along, across), (bl, bw, bh), z0, kind in model["boxes"]:
-                cx = px + hx * along - hy * across
-                cy = py + hy * along + hx * across
-                if kind == "glass":
-                    batch.add((cx, cy, z0), (bl, bw, bh), glass, yaw=yaw, spec=0.90)
-                elif kind == "trim":
-                    batch.add((cx, cy, z0), (bl, bw, bh), TRIM_COLOR, yaw=yaw, spec=0.06)
-                else:
-                    batch.add((cx, cy, z0), (bl, bw, bh), color, yaw=yaw, spec=0.34)
-            # Wheels: tire + a brighter hub poking through the outer face.
-            wx, wy = length / 2 - 0.78, width / 2 - 0.02
-            for sa in (1, -1):
-                for sb in (1, -1):
-                    cx = px + hx * (sa * wx) - hy * (sb * wy)
-                    cy = py + hy * (sa * wx) + hx * (sb * wy)
-                    batch.add((cx, cy, 0.0), (0.74, 0.30, 0.68), TIRE, yaw=yaw)
-                    hx2 = px + hx * (sa * wx) - hy * (sb * (wy + 0.06))
-                    hy2 = py + hy * (sa * wx) + hx * (sb * (wy + 0.06))
-                    batch.add((hx2, hy2, 0.16), (0.34, 0.22, 0.34), HUB_COLOR,
-                              yaw=yaw, spec=0.75)
-            # Side mirrors.
-            ma = model["mirror_along"]
-            for sb in (1, -1):
-                cx = px + hx * ma - hy * (sb * (width / 2 + 0.14))
-                cy = py + hy * ma + hx * (sb * (width / 2 + 0.14))
-                batch.add((cx, cy, 0.98), (0.24, 0.20, 0.20), TRIM_COLOR,
-                          yaw=yaw, spec=0.3)
-            # Head / tail light strips.
-            for sa, lcolor in ((1, HEADLIGHT), (-1, TAILLIGHT)):
+            length, width = mesh.foot
+            # World transform: yaw about z, then braking dive / squat about
+            # the axle line (pitch about the car's lateral axis).
+            cy_, sy_ = np.cos(yaw), np.sin(yaw)
+            cp, sp = np.cos(car.pitch), np.sin(car.pitch)
+            rot = np.array(
+                [[cy_ * cp, -sy_, cy_ * sp],
+                 [sy_ * cp, cy_, sy_ * sp],
+                 [-sp, 0.0, cp]]
+            )
+            verts = mesh.verts @ rot.T
+            verts = verts + np.array([px, py, 0.0])
+            normals = mesh.normals @ rot.T
+            mat_colors = np.array(
+                [color, glass, TRIM_COLOR, TIRE, HUB_COLOR], dtype=np.float64
+            )
+            tribatch.add_mesh(
+                verts, mesh.tris, normals, mat_colors[mesh.mats], MAT_SPECS[mesh.mats]
+            )
+            # Dynamic lights ride along as emissive boxes.
+            brake = BRAKE_ON if car.braking else BRAKE_OFF
+            for sa, lcolor, lspec in ((1, HEADLIGHT, 0.85), (-1, brake, 0.9)):
                 cx = px + hx * (sa * (length / 2 + 0.02))
-                cy = py + hy * (sa * (length / 2 + 0.02))
-                batch.add((cx, cy, 0.52), (0.10, width * 0.70, 0.17), lcolor,
-                          yaw=yaw, spec=0.85)
+                cyy = py + hy * (sa * (length / 2 + 0.02))
+                batch.add((cx, cyy, 0.52), (0.10, width * 0.62, 0.17), lcolor,
+                          yaw=yaw, spec=lspec)
+            if car.blinker_on(anim_t):
+                side = 1.0 if car.turn == "L" else -1.0  # driver's left is +y local
+                for sa in (1, -1):
+                    cx = px + hx * (sa * (length / 2 - 0.04)) - hy * (side * width / 2)
+                    cyy = py + hy * (sa * (length / 2 - 0.04)) + hx * (side * width / 2)
+                    batch.add((cx, cyy, 0.58), (0.16, 0.14, 0.15), BLINKER,
+                              yaw=yaw, spec=0.9)
 
     # ----------------------------------------------------------------- signals
 

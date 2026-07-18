@@ -108,7 +108,7 @@ SPAWNING, QUEUED, CROSSING = 0, 1, 2
 
 class AnimCar:
     __slots__ = ("veh_id", "approach", "turn", "state", "dist", "pos", "heading",
-                 "target_dist", "cross_t0")
+                 "target_dist", "cross_t0", "speed", "accel", "pitch", "braking")
 
     def __init__(self, veh_id: int, approach: int, turn: str):
         self.veh_id = veh_id
@@ -123,11 +123,27 @@ class AnimCar:
         self.pos = to_world(approach, LANE_X[turn], SPAWN_DIST)
         self.heading = to_world(approach, 0.0, -1.0)
         self.cross_t0 = 0.0
+        self.speed = APPROACH_SPEED
+        self.accel = 0.0
+        self.pitch = 0.0  # body dive (+nose down) under braking, squat under power
+        self.braking = False
 
     def start_crossing(self) -> None:
         self.state = CROSSING
         self.dist = 0.0
         self.pos, self.heading = _PATHS[(self.approach, self.turn)].at(0.0)
+
+    def _dynamics(self, new_speed: float, dt: float, stopped: bool) -> None:
+        if dt > 1e-9:
+            self.accel = (new_speed - self.speed) / dt
+        self.speed = new_speed
+        # Drivers hold the brake at a red; the body dives with decel, squats
+        # with accel, and settles quickly (smoothed toward the target).
+        self.braking = stopped or self.accel < -0.6
+        target = float(np.clip(-self.accel * 0.010, -0.045, 0.065))
+        if stopped:
+            target = 0.0
+        self.pitch += min(1.0, 6.0 * dt) * (target - self.pitch)
 
     def update(self, dt: float) -> bool:
         """Advance by dt sim-seconds. Returns False when the car despawns."""
@@ -141,17 +157,31 @@ class AnimCar:
             if self.dist >= path.length:
                 return False
             self.pos, self.heading = path.at(self.dist)
+            self._dynamics(v, dt, stopped=False)
             return True
         # Inbound: proportional ease toward the target slot — approach fast,
         # brake into the queue, creep as the queue advances.
         gap = self.dist - self.target_dist
+        v = 0.0
         if gap > 0.05:
             v = min(APPROACH_SPEED, max(CREEP_SPEED, gap * 0.9))
             self.dist = max(self.target_dist, self.dist - v * dt)
         self.pos = to_world(self.approach, LANE_X[self.turn], self.dist)
         if self.state == SPAWNING and abs(self.dist - self.target_dist) < 0.1:
             self.state = QUEUED
+        self._dynamics(v, dt, stopped=v < 0.05)
         return True
+
+    def blinker_on(self, anim_t: float) -> bool:
+        """Turn-signal flash: left/right turners blink while queued and
+        through the first two-thirds of the crossing, at ~1.5 Hz."""
+        if self.turn == "S":
+            return False
+        if self.state == CROSSING:
+            path = _PATHS[(self.approach, self.turn)]
+            if self.dist / max(path.length, 1e-9) > 0.66:
+                return False
+        return (anim_t * 1.5) % 1.0 < 0.55
 
 
 class CarAnimator:
